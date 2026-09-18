@@ -24,11 +24,12 @@ namespace {
 template<typename T>
 std::optional<ApiResult<T>> callResult(std::function<RequestId(ApiCompletion<T>)> invoker)
 {
-    std::optional<ApiResult<T>> result;
-    invoker([&result](ApiResult<T> value) {
-        result.emplace(std::move(value));
+    auto result = std::make_shared<std::optional<ApiResult<T>>>();
+    invoker([result](ApiResult<T> value) {
+        result->emplace(std::move(value));
     });
-    return result;
+    if (!QTest::qWaitFor([result] { return result->has_value(); }, 10000)) return std::nullopt;
+    return std::move(*result);
 }
 
 QString databasePath(QTemporaryDir& tempDir)

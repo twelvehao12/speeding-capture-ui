@@ -226,6 +226,7 @@ private slots:
     void tokenIsRequiredAndStoredByReference();
     void existingCredentialCanBeReused();
     void onlineSessionOpensSubStreamAndSupportsSwitching();
+    void rapidSelectionsCoalesceAndStopCancelsPendingOpen();
     void degradedHttpDoesNotStopVideoAndRtspFailureDoesNotChangeSession();
     void retryableRtspFailureDoesNotRaiseGlobalUserError();
     void rtspFailureReportsGenericStorageProblemFromLastHealth();
@@ -345,27 +346,28 @@ void DeviceIntegrationControllerTest::onlineSessionOpensSubStreamAndSupportsSwit
         QStringLiteral("device-a"), SecretValue(QByteArrayLiteral("token"))));
 
     fleet.sendSession(snapshot(fleet.lastProfile, DeviceSessionState::Online));
-    QCOMPARE(player.openCount, 1);
+    QTRY_VERIFY(player.openCount > 0);
+    QTRY_COMPARE(player.openCount, 1);
     QCOMPARE(player.lastStream.role, RtspStreamRole::Sub);
     QCOMPARE(player.lastStream.url, QUrl(QStringLiteral("rtsp://192.0.2.10/live/1")));
 
     controller.setStreamRole(RtspStreamRole::Main);
-    QCOMPARE(player.openCount, 2);
+    QTRY_COMPARE(player.openCount, 2);
     QCOMPARE(player.lastStream.role, RtspStreamRole::Main);
     QCOMPARE(player.lastStream.url, QUrl(QStringLiteral("rtsp://192.0.2.10/live/0")));
     controller.restartSelectedStream(QStringLiteral("other-device"));
-    QCOMPARE(player.openCount, 2);
+    QTRY_COMPARE(player.openCount, 2);
     controller.restartSelectedStream(QStringLiteral("device-a"));
-    QCOMPARE(player.openCount, 3);
+    QTRY_COMPARE(player.openCount, 3);
     QCOMPARE(player.lastStream.role, RtspStreamRole::Main);
     controller.setPlaybackSuspended(true);
     controller.restartSelectedStream(QStringLiteral("device-a"));
-    QCOMPARE(player.openCount, 3);
+    QTRY_COMPARE(player.openCount, 3);
     controller.setPlaybackSuspended(false);
-    QCOMPARE(player.openCount, 4);
+    QTRY_COMPARE(player.openCount, 4);
     controller.disconnectDevice(QStringLiteral("device-a"));
     controller.restartSelectedStream(QStringLiteral("device-a"));
-    QCOMPARE(player.openCount, 4);
+    QTRY_COMPARE(player.openCount, 4);
 }
 
 void DeviceIntegrationControllerTest::degradedHttpDoesNotStopVideoAndRtspFailureDoesNotChangeSession()
@@ -383,6 +385,7 @@ void DeviceIntegrationControllerTest::degradedHttpDoesNotStopVideoAndRtspFailure
     controller.connectDiscoveredDevice(
         QStringLiteral("device-a"), SecretValue(QByteArrayLiteral("token")));
     fleet.sendSession(snapshot(fleet.lastProfile, DeviceSessionState::Online));
+    QTRY_VERIFY(player.openCount > 0);
     fleet.sendSession(snapshot(fleet.lastProfile, DeviceSessionState::Degraded));
     QCOMPARE(player.stopCount, 0);
 
@@ -412,6 +415,7 @@ void DeviceIntegrationControllerTest::retryableRtspFailureDoesNotRaiseGlobalUser
     controller.connectDiscoveredDevice(
         QStringLiteral("device-a"), SecretValue(QByteArrayLiteral("token")));
     fleet.sendSession(snapshot(fleet.lastProfile, DeviceSessionState::Online));
+    QTRY_VERIFY(player.openCount > 0);
 
     ApiError rtspError;
     rtspError.code = QStringLiteral("rtsp_open_timeout");
@@ -514,6 +518,7 @@ void DeviceIntegrationControllerTest::authenticationFailureStopsVideoAndPromptsO
     controller.connectDiscoveredDevice(
         QStringLiteral("device-a"), SecretValue(QByteArrayLiteral("never-log-this")));
     fleet.sendSession(snapshot(fleet.lastProfile, DeviceSessionState::Online));
+    QTRY_VERIFY(player.openCount > 0);
     fleet.sendSession(snapshot(fleet.lastProfile, DeviceSessionState::AuthenticationFailed));
     fleet.sendSession(snapshot(fleet.lastProfile, DeviceSessionState::AuthenticationFailed));
 
@@ -544,14 +549,15 @@ void DeviceIntegrationControllerTest::selectingAnotherDeviceStopsOldVideoBeforeO
         QStringLiteral("device-a"), SecretValue(QByteArrayLiteral("token-a")));
     const DeviceProfile profileA = fleet.lastProfile;
     fleet.sendSession(snapshot(profileA, DeviceSessionState::Online));
+    QTRY_COMPARE(player.openCount, 1);
 
     controller.connectDiscoveredDevice(
         QStringLiteral("device-b"), SecretValue(QByteArrayLiteral("token-b")));
     const DeviceProfile profileB = fleet.lastProfile;
     QCOMPARE(player.stopCount, 1);
-    QCOMPARE(player.openCount, 1);
+    QTRY_COMPARE(player.openCount, 1);
     fleet.sendSession(snapshot(profileB, DeviceSessionState::Online));
-    QCOMPARE(player.openCount, 2);
+    QTRY_COMPARE(player.openCount, 2);
     QCOMPARE(player.lastStream.deviceId, QStringLiteral("device-b"));
     QCOMPARE(player.lastStream.url.host(), QStringLiteral("192.0.2.20"));
 }
@@ -569,6 +575,7 @@ void DeviceIntegrationControllerTest::disconnectAndShutdownReleaseResources()
         controller.connectDiscoveredDevice(
             QStringLiteral("device-a"), SecretValue(QByteArrayLiteral("token")));
         fleet.sendSession(snapshot(fleet.lastProfile, DeviceSessionState::Online));
+    QTRY_VERIFY(player.openCount > 0);
 
         controller.disconnectDevice(QStringLiteral("device-a"));
         QCOMPARE(player.stopCount, 1);
@@ -606,6 +613,36 @@ DeviceSessionSnapshot DeviceIntegrationControllerTest::snapshot(const DeviceProf
     value.profile = profile;
     value.state = state;
     return value;
+}
+
+void DeviceIntegrationControllerTest::rapidSelectionsCoalesceAndStopCancelsPendingOpen()
+{
+    FakeDiscoveryService discovery;
+    FakeFleetService fleet;
+    FakeSecretStore secrets;
+    FakeRtspPlayer player;
+    DeviceIntegrationController controller({&discovery, &fleet, &secrets, &player});
+    const auto scan = controller.startScan();
+    discovery.sendDevice(scan, discovered());
+    QVERIFY(controller.connectDiscoveredDevice(QStringLiteral("device-a"), SecretValue(QByteArrayLiteral("token"))));
+    const auto online = snapshot(fleet.lastProfile, DeviceSessionState::Online);
+    fleet.sendSession(online);
+    QTRY_COMPARE(player.openCount, 1);
+    for (int i = 0; i < 1000; ++i) {
+        controller.setStreamRole(i % 2 ? RtspStreamRole::Main : RtspStreamRole::Sub);
+        fleet.sendSession(online); // Repeated profile/status notifications.
+    }
+    QCOMPARE(player.openCount, 1);
+    QTRY_COMPARE(player.openCount, 2);
+    QCOMPARE(player.lastStream.role, RtspStreamRole::Main);
+    fleet.sendSession(online);
+    QTest::qWait(250);
+    QCOMPARE(player.openCount, 2);
+    controller.setStreamRole(RtspStreamRole::Sub);
+    controller.setPlaybackSuspended(true);
+    QCOMPARE(player.stopCount, 1);
+    QTest::qWait(250);
+    QCOMPARE(player.openCount, 2);
 }
 
 QTEST_MAIN(DeviceIntegrationControllerTest)

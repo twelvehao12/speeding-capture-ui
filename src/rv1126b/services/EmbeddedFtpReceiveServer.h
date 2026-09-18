@@ -2,6 +2,7 @@
 
 #include <QHostAddress>
 #include <QObject>
+#include <QThread>
 
 class QTcpServer;
 
@@ -18,6 +19,8 @@ struct EmbeddedFtpReceiveServerConfig {
     quint16 passivePortEnd = 0;
 };
 
+class EmbeddedFtpReceiveWorker;
+
 class EmbeddedFtpReceiveServer final : public QObject
 {
     Q_OBJECT
@@ -27,6 +30,8 @@ public:
     ~EmbeddedFtpReceiveServer() override;
 
     bool start(const EmbeddedFtpReceiveServerConfig& config);
+    void startAsync(const EmbeddedFtpReceiveServerConfig& config);
+    bool isStarting() const { return starting_; }
     void stop();
 
     bool isListening() const;
@@ -35,22 +40,16 @@ public:
     EmbeddedFtpReceiveServerConfig config() const;
 
 signals:
+    void started(bool success);
     void fileStored(const QString& relativePath, qint64 bytes);
 
 private:
-    class Session;
-
-    friend class Session;
-
-    QString resolvePath(const QString& cwd, const QString& ftpPath, bool* ok, QString* relativePath) const;
-    QTcpServer* createPassiveServer(QString* errorMessage) const;
-    QHostAddress passiveReplyAddress() const;
-    void removeSession(Session* session);
-
+    QThread ioThread_;
+    EmbeddedFtpReceiveWorker* worker_ = nullptr;
     EmbeddedFtpReceiveServerConfig config_;
-    QTcpServer* controlServer_ = nullptr;
-    QList<Session*> sessions_;
     QString lastError_;
+    quint16 port_ = 0;
+    quint64 generation_ = 0;
+    bool starting_ = false;
 };
-
 } // namespace rv1126b

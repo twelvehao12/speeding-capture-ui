@@ -6,6 +6,7 @@
 #include <QElapsedTimer>
 #include <QRegularExpression>
 #include <QTcpSocket>
+#include <QTcpServer>
 #include <QTemporaryDir>
 #include <QtTest>
 
@@ -17,6 +18,7 @@ class EmbeddedFtpReceiveServerTest final : public QObject
 
 private slots:
     void storesUploadedFilesThroughPassiveFtp();
+    void abortedPassiveSessionReleasesListener();
 };
 
 namespace {
@@ -112,6 +114,30 @@ void EmbeddedFtpReceiveServerTest::storesUploadedFilesThroughPassiveFtp()
     QFile stored(QDir(root.path()).filePath(QStringLiteral("vehicle_events/20260722/event.json")));
     QVERIFY(stored.open(QIODevice::ReadOnly));
     QCOMPARE(stored.readAll(), QByteArrayLiteral("payload"));
+}
+
+void EmbeddedFtpReceiveServerTest::abortedPassiveSessionReleasesListener()
+{
+    QTemporaryDir dir;
+    EmbeddedFtpReceiveServer server;
+    EmbeddedFtpReceiveServerConfig config;
+    config.rootPath = dir.path();
+    config.password = QStringLiteral("secret");
+    config.listenAddress = QHostAddress::LocalHost;
+    QVERIFY(server.start(config));
+    QTcpSocket control;
+    control.connectToHost(QHostAddress::LocalHost, server.controlPort());
+    QVERIFY(control.waitForConnected(1000));
+    QVERIFY(readReply(control).startsWith(QStringLiteral("220 ")));
+    QVERIFY(commandReply(control, QStringLiteral("USER upload")).startsWith(QStringLiteral("331 ")));
+    QVERIFY(commandReply(control, QStringLiteral("PASS secret")).startsWith(QStringLiteral("230 ")));
+    const quint16 passivePort = enterExtendedPassive(control);
+    QVERIFY(passivePort > 0);
+    sendCommand(control, QStringLiteral("STOR interrupted.jpg"));
+    QVERIFY(readReply(control).startsWith(QStringLiteral("150 ")));
+    control.abort();
+    QTcpServer probe;
+    QTRY_VERIFY_WITH_TIMEOUT(probe.isListening() || probe.listen(QHostAddress::LocalHost, passivePort), 2000);
 }
 
 QTEST_MAIN(EmbeddedFtpReceiveServerTest)

@@ -31,10 +31,12 @@ private:
     void handleVideoFrame(const QVideoFrame& frame, quint64 attemptToken);
 
     QMediaPlayer* mediaPlayer_ = nullptr;
-    QVideoSink* videoSink_ = nullptr;
+    QPointer<QVideoSink> videoSink_;
     QPointer<QWidget> videoWidget_;
     QElapsedTimer renderThrottle_;
     QVector<QMetaObject::Connection> attemptConnections_;
+    quint64 activeAttemptToken_ = 0;
+    bool softwarePreview_ = false;
 };
 
 } // namespace rv1126b

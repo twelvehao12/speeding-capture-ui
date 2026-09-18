@@ -7,6 +7,64 @@
 #include <QPainter>
 #include <QPen>
 #include <QTimer>
+#include <QCache>
+#include <QFileInfo>
+#include <QMutex>
+#include <QPromise>
+#include <QThreadPool>
+#include <QResizeEvent>
+#include <QMouseEvent>
+#include <QDesktopServices>
+#include <QUrl>
+#include <memory>
+
+namespace {
+struct ImageLoaderState {
+    QMutex mutex;
+    QCache<QString, QImage> images{64 * 1024}; // KiB, shared by all previews.
+    QThreadPool pool;
+    ImageLoaderState() { pool.setMaxThreadCount(2); }
+    ~ImageLoaderState() { pool.waitForDone(); }
+};
+
+ImageLoaderState& imageState()
+{
+    static ImageLoaderState state;
+    return state;
+}
+
+QThreadPool& imagePool()
+{
+    return imageState().pool;
+}
+
+QImage readPreviewImage(const QString& path, QSize bounds)
+{
+    auto& mutex = imageState().mutex;
+    auto& images = imageState().images;
+    const QFileInfo info(path);
+    const QString key = QStringLiteral("%1|%2|%3|%4x%5")
+        .arg(info.absoluteFilePath()).arg(info.size()).arg(info.lastModified().toMSecsSinceEpoch())
+        .arg(bounds.width()).arg(bounds.height());
+    {
+        QMutexLocker lock(&mutex);
+        if (const auto* image = images.object(key)) return *image;
+    }
+    QImageReader reader(path);
+    reader.setAutoTransform(true);
+    QSize source = reader.size();
+    if (!source.isValid()) return {};
+    if (reader.transformation() & QImageIOHandler::TransformationRotate90) bounds.transpose();
+    reader.setScaledSize(source.scaled(bounds, Qt::KeepAspectRatio));
+    QImage image = reader.read();
+    if (!image.isNull()) {
+        QMutexLocker lock(&mutex);
+        const int cost = int((image.sizeInBytes() + 1023) / 1024);
+        images.insert(key, new QImage(image), cost);
+    }
+    return image;
+}
+}
 
 VideoWidget::VideoWidget(Mode mode, QWidget* parent)
     : QWidget(parent)
@@ -15,10 +73,20 @@ VideoWidget::VideoWidget(Mode mode, QWidget* parent)
 {
     setMinimumSize(320, 220);
     setAutoFillBackground(false);
+    if (mode_ == Mode::Snapshot) setToolTip(QStringLiteral("双击查看原图"));
 
     timer_->setInterval(mode_ == Mode::Live ? 1000 / displayOptions_.previewFrameRate : 500);
     connect(timer_, &QTimer::timeout, this, &VideoWidget::advanceFrame);
     timer_->start();
+    evidenceLoadTimer_ = new QTimer(this);
+    evidenceLoadTimer_->setSingleShot(true);
+    evidenceLoadTimer_->setInterval(100);
+    connect(evidenceLoadTimer_, &QTimer::timeout, this, &VideoWidget::loadEvidenceImage);
+}
+
+VideoWidget::~VideoWidget()
+{
+    if (imageWatcher_) imageWatcher_->cancel();
 }
 
 void VideoWidget::setDevice(const Device* device)
@@ -32,6 +100,7 @@ void VideoWidget::setDevice(const Device* device)
 
 void VideoWidget::setLatestRecord(const CaptureRecord* record)
 {
+    if (!timer_->isActive()) timer_->start();
     hasVehicleEvent_ = false;
     hasLatestRecord_ = record != nullptr;
     if (record) {
@@ -42,6 +111,16 @@ void VideoWidget::setLatestRecord(const CaptureRecord* record)
 
 void VideoWidget::setVehicleEvent(const rv1126b::VehicleEvent* event)
 {
+    timer_->stop();
+    if (event && hasVehicleEvent_ && vehicleEvent_.identity == event->identity
+        && vehicleEvent_.evidenceRelativeUrl == event->evidenceRelativeUrl) {
+        vehicleEvent_ = *event;
+        update();
+        return;
+    }
+    ++imageGeneration_;
+    evidenceLoadTimer_->stop();
+    imageLease_.reset();
     hasVehicleEvent_ = event != nullptr;
     evidenceEntry_.reset();
     evidenceImage_ = QImage();
@@ -54,6 +133,16 @@ void VideoWidget::setEvidenceState(
     const std::optional<rv1126b::EvidenceCacheEntry>& entry,
     bool deviceOnline)
 {
+    if (entry && (!hasVehicleEvent_ || entry->identity != vehicleEvent_.identity)) return;
+    if (entry && evidenceEntry_ && entry->identity == evidenceEntry_->identity
+        && entry->status == rv1126b::EvidenceCacheStatus::Available
+        && entry->status == evidenceEntry_->status && entry->localFilePath == evidenceEntry_->localFilePath
+        && entry->updatedEpochMs == evidenceEntry_->updatedEpochMs
+        && entry->contentLength == evidenceEntry_->contentLength
+        && (!evidenceImage_.isNull() || evidenceLoadTimer_->isActive() || imageWatcher_)) return;
+    ++imageGeneration_;
+    evidenceLoadTimer_->stop();
+    imageLease_.reset();
     evidenceEntry_ = entry;
     evidenceDeviceOnline_ = deviceOnline;
     evidenceImage_ = QImage();
@@ -69,11 +158,8 @@ void VideoWidget::setEvidenceState(
     using rv1126b::EvidenceCacheStatus;
     switch (entry->status) {
     case EvidenceCacheStatus::Available: {
-        QImageReader reader(entry->localFilePath);
-        reader.setAutoTransform(true);
-        evidenceImage_ = reader.read();
-        evidenceMessage_ = evidenceImage_.isNull()
-            ? QStringLiteral("本地图片损坏或无法解码") : QString();
+        evidenceMessage_ = QStringLiteral("正在读取图片…");
+        evidenceLoadTimer_->start();
         break;
     }
     case EvidenceCacheStatus::Queued:
@@ -102,6 +188,9 @@ void VideoWidget::setEvidenceState(
 
 void VideoWidget::clearVehicleEvent()
 {
+    ++imageGeneration_;
+    evidenceLoadTimer_->stop();
+    imageLease_.reset();
     hasVehicleEvent_ = false;
     evidenceEntry_.reset();
     evidenceImage_ = QImage();
@@ -111,6 +200,60 @@ void VideoWidget::clearVehicleEvent()
 
 QString VideoWidget::evidenceMessage() const { return evidenceMessage_; }
 bool VideoWidget::hasDecodedEvidence() const { return !evidenceImage_.isNull(); }
+
+void VideoWidget::mouseDoubleClickEvent(QMouseEvent* event)
+{
+    if (event->button() == Qt::LeftButton && evidenceEntry_
+        && evidenceEntry_->status == rv1126b::EvidenceCacheStatus::Available) {
+        if (!QDesktopServices::openUrl(QUrl::fromLocalFile(evidenceEntry_->localFilePath))) {
+            evidenceMessage_ = QStringLiteral("无法打开原图");
+            update();
+        }
+        event->accept();
+        return;
+    }
+    QWidget::mouseDoubleClickEvent(event);
+}
+
+void VideoWidget::resizeEvent(QResizeEvent* event)
+{
+    QWidget::resizeEvent(event);
+    if (hasVehicleEvent_ && evidenceEntry_
+        && evidenceEntry_->status == rv1126b::EvidenceCacheStatus::Available) {
+        ++imageGeneration_;
+        evidenceLoadTimer_->start();
+    }
+}
+
+void VideoWidget::loadEvidenceImage()
+{
+    if (imageWatcher_ || !hasVehicleEvent_ || !evidenceEntry_
+        || evidenceEntry_->status != rv1126b::EvidenceCacheStatus::Available) return;
+    const auto generation = imageGeneration_;
+    const QString path = evidenceEntry_->localFilePath;
+    imageLease_ = rv1126b::CacheFileLease::acquire(path);
+    if (!imageLease_) { evidenceLoadTimer_->start(); return; }
+    const QSize bounds = (size() * devicePixelRatioF()).expandedTo(QSize(1, 1));
+    auto promise = std::make_shared<QPromise<QImage>>();
+    auto* watcher = new QFutureWatcher<QImage>(this);
+    imageWatcher_ = watcher;
+    connect(watcher, &QFutureWatcher<QImage>::finished, this, [this, watcher, generation] {
+        imageWatcher_ = nullptr;
+        if (generation == imageGeneration_ && !watcher->isCanceled()) {
+            evidenceImage_ = watcher->result();
+            evidenceMessage_ = evidenceImage_.isNull() ? QStringLiteral("本地图片损坏或无法解码") : QString();
+            update();
+        }
+        watcher->deleteLater();
+        if (generation != imageGeneration_ && !evidenceLoadTimer_->isActive()) loadEvidenceImage();
+    });
+    promise->start();
+    watcher->setFuture(promise->future());
+    imagePool().start([promise, path, bounds, lease = imageLease_] {
+        if (!promise->isCanceled()) promise->addResult(readPreviewImage(path, bounds));
+        promise->finish();
+    });
+}
 
 void VideoWidget::setDisplayOptions(const VideoDisplayOptions& options)
 {

@@ -9,6 +9,9 @@
 #include <QRegularExpression>
 #include <QTimer>
 #include <QStandardPaths>
+#include <QFutureWatcher>
+#include <QPromise>
+#include <QThreadPool>
 
 #include <algorithm>
 #include <array>
@@ -80,10 +83,16 @@ BoardEvidenceCache::BoardEvidenceCache(
     , repository_(repository)
     , cacheRootPath_(std::move(cacheRootPath))
 {
+    refillTimer_.setInterval(2000);
+    connect(&refillTimer_, &QTimer::timeout, this, &BoardEvidenceCache::refillQueue);
+    refillTimer_.start();
 }
 
 void BoardEvidenceCache::enqueue(const VehicleEvent& event)
 {
+    stopped_ = false;
+    eligibleDevices_.insert(event.identity.deviceId);
+    suspendedDevices_.remove(event.identity.deviceId);
     if (event.identity.deviceId.isEmpty()) {
         return;
     }
@@ -93,40 +102,50 @@ void BoardEvidenceCache::enqueue(const VehicleEvent& event)
         return;
     }
 
+    if (queuedIdentities_.contains(event.identity) || active_.contains(event.identity)
+        || lookups_.contains(event.identity) || scheduledRetries_.contains(event.identity)) {
+        return;
+    }
+    if (queue_.size() + lookups_.size() + scheduledRetries_.size() >= MaxQueuedDownloads) {
+        // Persist overflow without retaining full events or notification
+        // entries in the download scheduler. Only requested work is refilled.
+        if (repository_) repository_->saveEvidenceState(entryFor(event, EvidenceCacheStatus::Queued), this,
+            [this, identity = event.identity](ApiResult<void> result) {
+                if (!result) emit cacheError(identity, result.error());
+            });
+        return;
+    }
+    const quint64 generation = ++nextGeneration_;
+    lookups_.insert(event.identity, generation);
+    if (repository_) {
+        repository_->loadEvidenceState(event.identity, QStringLiteral("evidence"), this,
+            [this, event, generation](ApiResult<std::optional<EvidenceCacheEntry>> result) {
+                enqueueAfterLookup(event, generation, std::move(result));
+            });
+    } else enqueueAfterLookup(event, generation,
+        ApiResult<std::optional<EvidenceCacheEntry>>::success(std::nullopt));
+}
+
+void BoardEvidenceCache::enqueueAfterLookup(const VehicleEvent& event, quint64 generation,
+                                          ApiResult<std::optional<EvidenceCacheEntry>> result)
+{
+    if (lookups_.value(event.identity) != generation) return;
+    lookups_.remove(event.identity);
+    if (!result) { emit cacheError(event.identity, result.error()); return; }
     const QString finalPath = finalPathFor(event);
     if (QFileInfo::exists(finalPath)) {
-        bool reuseCachedFile = true;
-        if (repository_) {
-            bool completed = false;
-            repository_->loadEvidenceState(
-                event.identity,
-                QStringLiteral("evidence"),
-                this,
-                [&reuseCachedFile, &completed, &event](ApiResult<std::optional<EvidenceCacheEntry>> result) {
-                    completed = true;
-                    if (result.isSuccess() && result.value().has_value()
-                        && !sameRemoteImageUrl(result.value()->remoteRelativeUrl, event.evidenceRelativeUrl)) {
-                        reuseCachedFile = false;
-                    }
-                });
-            if (!completed) {
-                reuseCachedFile = true;
-            }
-        }
-        if (reuseCachedFile) {
-            EvidenceCacheEntry entry = entryFor(event, EvidenceCacheStatus::Available);
+        if (!result.value() || sameRemoteImageUrl(result.value()->remoteRelativeUrl, event.evidenceRelativeUrl)) {
+            auto entry = entryFor(event, EvidenceCacheStatus::Available);
             entry.localFilePath = finalPath;
             entry.contentLength = QFileInfo(finalPath).size();
-            persistState(entry);
+            // Reusing a valid entry must not write the same state on every list refresh.
+            if (result.value() && result.value()->status == EvidenceCacheStatus::Available)
+                emit stateChanged(entry);
+            else persistState(entry);
             return;
         }
         QFile::remove(finalPath);
     }
-
-    if (queuedIdentities_.contains(event.identity) || active_.contains(event.identity)) {
-        return;
-    }
-
     queue_.append(event);
     queuedIdentities_.insert(event.identity);
     persistState(entryFor(event, EvidenceCacheStatus::Queued));
@@ -138,29 +157,49 @@ RequestId BoardEvidenceCache::removeLocal(
     QObject* context,
     ApiCompletion<void> completion)
 {
-    Q_UNUSED(context)
     const RequestId requestId = RequestId::createUuid();
     cancel(event.identity);
-
     const QString finalPath = finalPathFor(event);
-    if (QFileInfo::exists(finalPath) && !QFile::remove(finalPath)) {
-        if (completion) {
-            completion(ApiResult<void>::failure(makeCacheError(
-                QStringLiteral("cache_remove_failed"),
-                QStringLiteral("Failed to remove cached evidence file: %1").arg(finalPath))));
-        }
-        return requestId;
-    }
-
-    if (completion) {
-        completion(ApiResult<void>::success());
-    }
+    auto promise = std::make_shared<QPromise<bool>>();
+    auto* watcher = new QFutureWatcher<bool>(context ? context : this);
+    connect(watcher, &QFutureWatcher<bool>::finished, this,
+        [this, watcher, finalPath, completion = std::move(completion)]() mutable {
+            if (!watcher->isCanceled() && completion) {
+                if (watcher->result()) completion(ApiResult<void>::success());
+                else completion(ApiResult<void>::failure(makeCacheError(QStringLiteral("cache_remove_failed"),
+                    QStringLiteral("Failed to remove cached evidence file: %1").arg(finalPath))));
+            }
+            watcher->deleteLater();
+        });
+    connect(watcher, &QObject::destroyed, this, [promise] { promise->future().cancel(); });
+    promise->start();
+    watcher->setFuture(promise->future());
+    static QThreadPool removalPool;
+    removalPool.setMaxThreadCount(1);
+    removalPool.start([promise, finalPath] {
+        if (!promise->isCanceled()) promise->addResult(!QFileInfo::exists(finalPath) || QFile::remove(finalPath));
+        promise->finish();
+    });
     return requestId;
 }
 
 void BoardEvidenceCache::cancel(const EventIdentity& identity)
 {
+    // Invalidate a refill already in flight, and persist cancellation so that
+    // the next refill cannot silently resurrect this download.
+    ++refillGeneration_;
+    refillPending_ = false;
+    stateNotifications_.remove(identity);
+    lookups_.remove(identity);
     cancelRetry(identity);
+    EvidenceCacheEntry cancelled;
+    cancelled.identity = identity;
+    cancelled.role = QStringLiteral("evidence");
+    cancelled.remoteRelativeUrl = QStringLiteral("");
+    cancelled.status = EvidenceCacheStatus::Failed;
+    cancelled.failureCode = QStringLiteral("cancelled");
+    cancelled.updatedEpochMs = nowEpochMs();
+    persistState(cancelled);
 
     const auto queuedEnd = std::remove_if(queue_.begin(), queue_.end(), [&identity](const VehicleEvent& event) {
         return hasIdentity(event, identity);
@@ -175,16 +214,18 @@ void BoardEvidenceCache::cancel(const EventIdentity& identity)
         return;
     }
 
-    if (activeIt->apiClient) {
-        activeIt->apiClient->cancel(activeIt->requestId);
-    }
-    QFile::remove(activeIt->partFilePath);
+    const ActiveDownload active = *activeIt;
     finishActive(identity);
+    if (active.apiClient) active.apiClient->cancel(active.requestId);
+    QFile::remove(active.partFilePath);
     drainQueue();
 }
 
 void BoardEvidenceCache::cancelDevice(const QString& deviceId)
 {
+    suspendedDevices_.insert(deviceId);
+    eligibleDevices_.remove(deviceId);
+    for (const auto& id : lookups_.keys()) if (id.deviceId == deviceId) lookups_.remove(id);
     cancelRetriesForDevice(deviceId);
 
     const auto queuedEnd = std::remove_if(queue_.begin(), queue_.end(), [&deviceId, this](const VehicleEvent& event) {
@@ -210,20 +251,28 @@ void BoardEvidenceCache::cancelDevice(const QString& deviceId)
 
 void BoardEvidenceCache::cancelAll()
 {
+    stopped_ = true;
+    eligibleDevices_.clear();
+    ++refillGeneration_;
+    refillPending_ = false;
+    lookups_.clear();
+    stateNotifications_.clear();
     queue_.clear();
     queuedIdentities_.clear();
     scheduledRetries_.clear();
     retryAttempts_.clear();
 
     const QVector<ActiveDownload> activeDownloads = active_.values();
+    active_.clear();
+    activePerDevice_.clear();
     for (const ActiveDownload& active : activeDownloads) {
         if (active.apiClient) {
             active.apiClient->cancel(active.requestId);
         }
         QFile::remove(active.partFilePath);
     }
-    active_.clear();
-    activePerDevice_.clear();
+    setProperty("activeDownloadCount", 0);
+    setProperty("queuedDownloadCount", 0);
 }
 
 QString BoardEvidenceCache::finalPathFor(const VehicleEvent& event) const
@@ -243,6 +292,7 @@ bool BoardEvidenceCache::setCacheRootPath(const QString& cacheRootPath)
 
 void BoardEvidenceCache::drainQueue()
 {
+    if (stopped_) return;
     bool started = true;
     while (started && active_.size() < MaxConcurrentDownloads) {
         started = false;
@@ -259,6 +309,9 @@ void BoardEvidenceCache::drainQueue()
             break;
         }
     }
+    setProperty("queuedDownloadCount", queue_.size() + lookups_.size());
+    setProperty("activeDownloadCount", active_.size());
+    QTimer::singleShot(0, this, &BoardEvidenceCache::refillQueue);
 }
 
 bool BoardEvidenceCache::canStart(const VehicleEvent& event) const
@@ -267,8 +320,31 @@ bool BoardEvidenceCache::canStart(const VehicleEvent& event) const
         && active_.size() < MaxConcurrentDownloads;
 }
 
+void BoardEvidenceCache::refillQueue()
+{
+    const int room = MaxQueuedDownloads - queue_.size() - lookups_.size() - scheduledRetries_.size();
+    if (stopped_ || refillPending_ || room <= 0 || !repository_ || eligibleDevices_.isEmpty()) return;
+    QVector<EventIdentity> excluded = queuedIdentities_.values();
+    excluded += active_.keys();
+    excluded += lookups_.keys();
+    excluded += scheduledRetries_.keys();
+    const auto generation = refillGeneration_;
+    refillPending_ = true;
+    repository_->loadPendingEvidence(qMin(room, 64), eligibleDevices_.values(), excluded, this,
+        [this, generation](ApiResult<QVector<VehicleEvent>> result) {
+            if (generation != refillGeneration_) return;
+            refillPending_ = false;
+            if (!result || stopped_) return;
+            for (const auto& event : result.value()) {
+                if (eligibleDevices_.contains(event.identity.deviceId)) enqueue(event);
+            }
+        });
+}
+
 void BoardEvidenceCache::startDownload(const VehicleEvent& event)
 {
+    const auto lease = CacheFileLease::acquire(finalPathFor(event));
+    if (!lease) { scheduleRetry(event); return; }
     IBoardApiClient* apiClient = apiClientResolver_ ? apiClientResolver_(event.identity.deviceId) : nullptr;
     if (!apiClient || !repository_) {
         persistFailure(
@@ -286,7 +362,8 @@ void BoardEvidenceCache::startDownload(const VehicleEvent& event)
         return;
     }
 
-    const QString partFilePath = partPathFor(event);
+    const quint64 generation = ++nextGeneration_;
+    const QString partFilePath = finalPathFor(event) + QStringLiteral(".%1.part").arg(generation);
     QFile::remove(partFilePath);
 
     ActiveDownload active;
@@ -295,6 +372,8 @@ void BoardEvidenceCache::startDownload(const VehicleEvent& event)
     active.entry.localFilePath = finalPathFor(event);
     active.partFilePath = partFilePath;
     active.apiClient = apiClient;
+    active.generation = generation;
+    active.lease = lease;
 
     activePerDevice_[event.identity.deviceId] = activePerDevice_.value(event.identity.deviceId, 0) + 1;
     persistState(active.entry);
@@ -307,22 +386,28 @@ void BoardEvidenceCache::startDownload(const VehicleEvent& event)
         event.evidenceRelativeUrl,
         partFilePath,
         this,
-        [this, identity](ApiResult<EvidenceDownloadResult> result) {
-            handleDownloadFinished(identity, std::move(result));
+        [this, identity, generation, guard = QPointer<BoardEvidenceCache>(this)](ApiResult<EvidenceDownloadResult> result) {
+            if (!guard) {
+                if (result) QFile::remove(result.value().partFilePath);
+                return;
+            }
+            handleDownloadFinished(identity, generation, std::move(result));
         });
 
     const auto activeIt = active_.find(identity);
-    if (activeIt != active_.end()) {
+    if (activeIt != active_.end() && activeIt->generation == generation) {
         activeIt->requestId = requestId;
     }
 }
 
 void BoardEvidenceCache::handleDownloadFinished(
     const EventIdentity& identity,
+    quint64 generation,
     ApiResult<EvidenceDownloadResult> result)
 {
     const auto activeIt = active_.find(identity);
-    if (activeIt == active_.end()) {
+    if (activeIt == active_.end() || activeIt->generation != generation) {
+        if (result) QFile::remove(result.value().partFilePath);
         return;
     }
 
@@ -334,7 +419,7 @@ void BoardEvidenceCache::handleDownloadFinished(
         persistFailure(event, statusForError(error), error);
         if (statusForError(error) == EvidenceCacheStatus::RetryWait) {
             scheduleRetry(event);
-        }
+        } else retryAttempts_.remove(identity);
         drainQueue();
         return;
     }
@@ -390,11 +475,11 @@ void BoardEvidenceCache::scheduleRetry(const VehicleEvent& event)
         return;
     }
 
-    scheduledRetries_.insert(identity);
-    QTimer::singleShot(nextRetryDelayMs(identity), this, [this, event, identity] {
-        if (!scheduledRetries_.remove(identity)) {
-            return;
-        }
+    const quint64 generation = ++nextGeneration_;
+    scheduledRetries_.insert(identity, generation);
+    QTimer::singleShot(nextRetryDelayMs(identity), this, [this, event, identity, generation] {
+        if (scheduledRetries_.value(identity) != generation) return;
+        scheduledRetries_.remove(identity);
         enqueue(event);
     });
 }
@@ -408,7 +493,7 @@ void BoardEvidenceCache::cancelRetry(const EventIdentity& identity)
 void BoardEvidenceCache::cancelRetriesForDevice(const QString& deviceId)
 {
     QVector<EventIdentity> identities;
-    for (const EventIdentity& identity : scheduledRetries_) {
+    for (const EventIdentity& identity : scheduledRetries_.keys()) {
         if (identity.deviceId == deviceId) {
             identities.append(identity);
         }
@@ -433,10 +518,14 @@ void BoardEvidenceCache::persistState(const EvidenceCacheEntry& entry)
         return;
     }
 
+    const quint64 generation = ++nextGeneration_;
+    stateNotifications_.insert(entry.identity, generation);
     repository_->saveEvidenceState(
         entry,
         this,
-        [this, entry](ApiResult<void> result) {
+        [this, entry, generation](ApiResult<void> result) {
+            if (stateNotifications_.value(entry.identity) != generation) return;
+            stateNotifications_.remove(entry.identity);
             if (!result.isSuccess()) {
                 emit cacheError(entry.identity, result.error());
                 return;

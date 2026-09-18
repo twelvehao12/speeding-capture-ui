@@ -8,6 +8,7 @@
 #include <QPlaybackOptions>
 #include <QVideoFrame>
 #include <QVideoSink>
+#include <QVideoWidget>
 #include <QWidget>
 
 #include <chrono>
@@ -48,10 +49,12 @@ protected:
             targetSize.width(),
             targetSize.height());
         painter.drawImage(target, frame_);
+        setProperty("softwarePaintCount", ++paintCount_);
     }
 
 private:
     QImage frame_;
+    quint64 paintCount_ = 0;
 };
 
 } // namespace
@@ -61,10 +64,21 @@ namespace rv1126b {
 QtMediaPlaybackBackend::QtMediaPlaybackBackend(QObject* parent)
     : IMediaPlaybackBackend(parent)
     , mediaPlayer_(new QMediaPlayer(this))
-    , videoSink_(new QVideoSink(this))
-    , videoWidget_(new VideoFrameWidget)
 {
-    mediaPlayer_->setVideoOutput(videoSink_);
+    softwarePreview_ = qEnvironmentVariable("CAMERA_PREVIEW_RENDERER") == QLatin1String("software");
+    if (softwarePreview_) {
+        videoWidget_ = new VideoFrameWidget;
+        videoSink_ = new QVideoSink(this);
+        mediaPlayer_->setVideoOutput(videoSink_);
+    } else {
+        auto* output = new QVideoWidget;
+        output->setMinimumSize(640, 360);
+        output->setAspectRatioMode(Qt::KeepAspectRatio);
+        videoWidget_ = output;
+        videoSink_ = output->videoSink();
+        mediaPlayer_->setVideoOutput(output);
+    }
+    videoWidget_->setProperty("previewRenderer", softwarePreview_ ? "software" : "native");
 }
 
 QtMediaPlaybackBackend::~QtMediaPlaybackBackend()
@@ -78,7 +92,11 @@ QtMediaPlaybackBackend::~QtMediaPlaybackBackend()
 
 void QtMediaPlaybackBackend::play(const QUrl& url, quint64 attemptToken)
 {
+    QElapsedTimer operation;
+    operation.start();
     stop();
+    activeAttemptToken_ = attemptToken;
+    renderThrottle_.invalidate();
 
     QPlaybackOptions options;
     options.setPlaybackIntent(QPlaybackOptions::PlaybackIntent::LowLatencyStreaming);
@@ -95,7 +113,7 @@ void QtMediaPlaybackBackend::play(const QUrl& url, quint64 attemptToken)
     attemptConnections_.append(connect(
         mediaPlayer_, &QMediaPlayer::errorOccurred, this,
         [this, attemptToken](QMediaPlayer::Error error, const QString&) {
-            if (error == QMediaPlayer::NoError) {
+            if (attemptToken != activeAttemptToken_ || error == QMediaPlayer::NoError) {
                 return;
             }
 
@@ -120,7 +138,7 @@ void QtMediaPlaybackBackend::play(const QUrl& url, quint64 attemptToken)
     attemptConnections_.append(connect(
         mediaPlayer_, &QMediaPlayer::mediaStatusChanged, this,
         [this, attemptToken](QMediaPlayer::MediaStatus status) {
-            if (status == QMediaPlayer::EndOfMedia) {
+            if (attemptToken == activeAttemptToken_ && status == QMediaPlayer::EndOfMedia) {
                 emit streamEnded(attemptToken);
             }
         }));
@@ -128,6 +146,7 @@ void QtMediaPlaybackBackend::play(const QUrl& url, quint64 attemptToken)
     attemptConnections_.append(connect(
         mediaPlayer_, &QMediaPlayer::metaDataChanged, this,
         [this, attemptToken]() {
+            if (attemptToken != activeAttemptToken_) return;
             const QMediaMetaData metadata = mediaPlayer_->metaData();
             emit metadataReady(
                 attemptToken,
@@ -138,13 +157,22 @@ void QtMediaPlaybackBackend::play(const QUrl& url, quint64 attemptToken)
 
     mediaPlayer_->setSource(url);
     mediaPlayer_->play();
+    setProperty("playMaxMs", qMax(property("playMaxMs").toLongLong(), operation.elapsed()));
 }
 
 void QtMediaPlaybackBackend::stop()
 {
+    if (activeAttemptToken_ == 0) return;
+    QElapsedTimer operation;
+    operation.start();
+    activeAttemptToken_ = 0;
     disconnectAttemptSignals();
     mediaPlayer_->stop();
     mediaPlayer_->setSource(QUrl());
+    if (videoSink_) videoSink_->setVideoFrame(QVideoFrame());
+    if (softwarePreview_ && videoWidget_)
+        static_cast<VideoFrameWidget*>(videoWidget_.data())->setFrame(QImage());
+    setProperty("stopMaxMs", qMax(property("stopMaxMs").toLongLong(), operation.elapsed()));
 }
 
 QWidget* QtMediaPlaybackBackend::outputWidget() const
@@ -154,11 +182,12 @@ QWidget* QtMediaPlaybackBackend::outputWidget() const
 
 void QtMediaPlaybackBackend::handleVideoFrame(const QVideoFrame& frame, quint64 attemptToken)
 {
-    if (!frame.isValid()) {
+    if (attemptToken == 0 || attemptToken != activeAttemptToken_ || !frame.isValid()) {
         return;
     }
+    setProperty("receivedFrameCount", property("receivedFrameCount").toULongLong() + 1);
     emit frameReady(attemptToken, frame.size(), frame.surfaceFormat().streamFrameRate());
-    if (!videoWidget_) {
+    if (!softwarePreview_ || !videoWidget_ || attemptToken != activeAttemptToken_) {
         return;
     }
     if (renderThrottle_.isValid() && renderThrottle_.elapsed() < 33) {

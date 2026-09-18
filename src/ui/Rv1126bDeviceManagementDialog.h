@@ -222,6 +222,7 @@ private:
     QPushButton* localFtpStartButton_ = nullptr;
     QPushButton* localFtpStopButton_ = nullptr;
     bool localFtpTargetIdAuto_ = true;
+    std::optional<bool> pendingLocalFtpApply_;
 
     QDateTimeEdit* taskStartEdit_ = nullptr;
     QDateTimeEdit* taskEndEdit_ = nullptr;

@@ -492,6 +492,8 @@ LivePreviewPanel::LivePreviewPanel(rv1126b::IRtspPlayer* player, QWidget* parent
     connect(saveDetectionButton_, &QPushButton::clicked, this, [this] { saveDetectionConfig(); });
     if (player) {
         connect(player, &rv1126b::IRtspPlayer::videoFrameReceived, this, [this](const QSize& frameSize) {
+            if (frameSize == actualFrameSize_) return;
+            actualFrameSize_ = frameSize;
             if (lineOverlay_) lineOverlay_->setFrameSize(frameSize);
             if (!frameSize.isValid()) return;
             const auto target = streamCombo_->currentData().toInt() == static_cast<int>(rv1126b::RtspStreamRole::Main)
@@ -505,6 +507,8 @@ LivePreviewPanel::LivePreviewPanel(rv1126b::IRtspPlayer* player, QWidget* parent
     }
     setDetectionBusy(false);
     setDetectionStatus(QString());
+    detectionRefreshTimer_.setSingleShot(true);
+    connect(&detectionRefreshTimer_, &QTimer::timeout, this, &LivePreviewPanel::loadDetectionConfig);
 }
 
 void LivePreviewPanel::setCurrentDevice(const QString& deviceId)
@@ -515,6 +519,9 @@ void LivePreviewPanel::setCurrentDevice(const QString& deviceId)
                               ? QStringLiteral("实时预览")
                               : QStringLiteral("实时预览 · %1").arg(deviceId));
     if (!changed) return;
+    invalidateDetectionRequests();
+    disconnect(detectionApiDestroyed_);
+    boardApi_ = nullptr;
     clearActualResolution();
     videoController_->setDevice(deviceId, nullptr);
     triggerModeConfig_.reset();
@@ -529,7 +536,18 @@ void LivePreviewPanel::setBoardApiClient(rv1126b::IBoardApiClient* boardApi, boo
 {
     videoController_->setDevice(currentDeviceId_, videoConfigAvailable ? boardApi : nullptr);
     if (boardApi_ == boardApi) return;
+    invalidateDetectionRequests();
+    disconnect(detectionApiDestroyed_);
     boardApi_ = boardApi;
+    if (boardApi) {
+        detectionApiDestroyed_ = connect(boardApi, &QObject::destroyed, this, [this] {
+            invalidateDetectionRequests();
+            boardApi_ = nullptr;
+            triggerModeConfig_.reset();
+            lineRegionConfig_.reset();
+            setDetectionBusy(false);
+        });
+    }
     triggerModeConfig_.reset();
     lineRegionConfig_.reset();
     triggerModeDirty_ = false;
@@ -556,6 +574,7 @@ void LivePreviewPanel::setPlaybackError(const rv1126b::ApiError& error)
 
 void LivePreviewPanel::clearActualResolution()
 {
+    actualFrameSize_ = QSize();
     actualResolutionLabel_->setText(QStringLiteral("实际分辨率：等待视频帧"));
     actualResolutionLabel_->setStyleSheet(QString());
 }
@@ -592,26 +611,35 @@ void LivePreviewPanel::loadDetectionConfig()
         return;
     }
     if (loadingDetection_ || savingDetection_) return;
+    if (!detectionContext_) detectionContext_ = new QObject(this);
+    const auto generation = detectionGeneration_;
+    detectionReadsPending_ = 2;
+    detectionReadFailed_ = false;
     loadingDetection_ = true;
     setDetectionBusy(true);
     setDetectionStatus(QStringLiteral("读取线位..."));
+    const QPointer<LivePreviewPanel> guard(this);
 
-    boardApi_->getTriggerModeConfig(this, [this](rv1126b::ApiResult<rv1126b::TriggerModeConfigDto> result) {
+    boardApi_->getTriggerModeConfig(detectionContext_, [this, generation, guard = QPointer<LivePreviewPanel>(this)](rv1126b::ApiResult<rv1126b::TriggerModeConfigDto> result) {
+        if (!guard || generation != detectionGeneration_) return;
         if (result.isSuccess()) {
             applyTriggerModeConfig(result.value());
         } else {
+            detectionReadFailed_ = true;
             setDetectionStatus(result.error().message, true);
         }
+        finishDetectionRead(generation);
     });
-    boardApi_->getLineRegionConfig(this, [this](rv1126b::ApiResult<rv1126b::LineRegionConfigDto> result) {
-        loadingDetection_ = false;
+    if (!guard || generation != detectionGeneration_ || !boardApi_) return;
+    boardApi_->getLineRegionConfig(detectionContext_, [this, generation, guard = QPointer<LivePreviewPanel>(this)](rv1126b::ApiResult<rv1126b::LineRegionConfigDto> result) {
+        if (!guard || generation != detectionGeneration_) return;
         if (result.isSuccess()) {
             applyLineRegionConfig(result.value());
-            setDetectionStatus(QStringLiteral("线位已读取"));
         } else {
+            detectionReadFailed_ = true;
             setDetectionStatus(result.error().message, true);
         }
-        setDetectionBusy(false);
+        finishDetectionRead(generation);
     });
 }
 
@@ -621,12 +649,14 @@ void LivePreviewPanel::saveDetectionConfig()
         setDetectionStatus(QStringLiteral("设备 API 不可用"), true);
         return;
     }
-    if (savingDetection_) return;
+    if (savingDetection_ || loadingDetection_) return;
     if (!triggerModeDirty_ && !lineRegionDirty_) {
         setDetectionStatus(QStringLiteral("没有需要保存的修改"));
         return;
     }
     savingDetection_ = true;
+    if (!detectionContext_) detectionContext_ = new QObject(this);
+    const auto generation = detectionGeneration_;
     setDetectionBusy(true);
     setDetectionStatus(QStringLiteral("保存线位..."));
 
@@ -640,7 +670,8 @@ void LivePreviewPanel::saveDetectionConfig()
         rv1126b::TriggerModeUpdate update;
         update.expectedRevision = triggerModeConfig_->revision;
         update.triggerMode = triggerModeCombo_->currentData().toString();
-        boardApi_->putTriggerModeConfig(update, this, [this](rv1126b::ApiResult<rv1126b::TriggerModeConfigDto> result) {
+        boardApi_->putTriggerModeConfig(update, detectionContext_, [this, generation, guard = QPointer<LivePreviewPanel>(this)](rv1126b::ApiResult<rv1126b::TriggerModeConfigDto> result) {
+            if (!guard || generation != detectionGeneration_ || !boardApi_) return;
             if (!result.isSuccess()) {
                 savingDetection_ = false;
                 setDetectionBusy(false);
@@ -657,6 +688,8 @@ void LivePreviewPanel::saveDetectionConfig()
 
 void LivePreviewPanel::saveLineRegionConfig(const QString& runtimeRevision, bool restartRequired)
 {
+    if (!boardApi_) return;
+    const auto generation = detectionGeneration_;
     if (!lineRegionDirty_) {
         applyRuntimeConfigIfNeeded(runtimeRevision, restartRequired);
         return;
@@ -672,7 +705,8 @@ void LivePreviewPanel::saveLineRegionConfig(const QString& runtimeRevision, bool
     update.lineRegion = *lineOverlay_->lineRegion();
     syncSingleDirectionAliases(&update.lineRegion);
     normalizeHiddenLinesForTriggerOnly(&update.lineRegion);
-    boardApi_->putLineRegionConfig(update, this, [this, restartRequired](rv1126b::ApiResult<rv1126b::LineRegionConfigDto> result) {
+    boardApi_->putLineRegionConfig(update, detectionContext_, [this, restartRequired, generation, guard = QPointer<LivePreviewPanel>(this)](rv1126b::ApiResult<rv1126b::LineRegionConfigDto> result) {
+        if (!guard || generation != detectionGeneration_ || !boardApi_) return;
         if (!result.isSuccess()) {
             savingDetection_ = false;
             setDetectionBusy(false);
@@ -686,6 +720,8 @@ void LivePreviewPanel::saveLineRegionConfig(const QString& runtimeRevision, bool
 
 void LivePreviewPanel::applyRuntimeConfigIfNeeded(const QString& runtimeRevision, bool restartRequired)
 {
+    if (!boardApi_) return;
+    const auto generation = detectionGeneration_;
     if (!restartRequired) {
         savingDetection_ = false;
         setDetectionBusy(false);
@@ -701,7 +737,8 @@ void LivePreviewPanel::applyRuntimeConfigIfNeeded(const QString& runtimeRevision
     rv1126b::RuntimeApplyUpdate update;
     update.expectedRevision = runtimeRevision;
     update.scope = QStringLiteral("rkipc");
-    boardApi_->applyRuntimeConfig(update, this, [this](rv1126b::ApiResult<rv1126b::RuntimeApplyDto> result) {
+    boardApi_->applyRuntimeConfig(update, detectionContext_, [this, generation, guard = QPointer<LivePreviewPanel>(this)](rv1126b::ApiResult<rv1126b::RuntimeApplyDto> result) {
+        if (!guard || generation != detectionGeneration_ || !boardApi_) return;
         savingDetection_ = false;
         setDetectionBusy(false);
         if (!result.isSuccess()) {
@@ -719,12 +756,25 @@ void LivePreviewPanel::applyRuntimeConfigIfNeeded(const QString& runtimeRevision
 void LivePreviewPanel::scheduleDetectionRefresh(int delayMs, const QString& message)
 {
     setDetectionStatus(message);
-    QTimer::singleShot(delayMs, this, [this] {
-        if (!boardApi_ || currentDeviceId_.isEmpty()) {
-            return;
-        }
-        loadDetectionConfig();
-    });
+    detectionRefreshTimer_.start(delayMs);
+}
+
+void LivePreviewPanel::invalidateDetectionRequests()
+{
+    ++detectionGeneration_;
+    detectionRefreshTimer_.stop();
+    delete detectionContext_.data();
+    loadingDetection_ = savingDetection_ = false;
+    detectionReadsPending_ = 0;
+    setDetectionBusy(false);
+}
+
+void LivePreviewPanel::finishDetectionRead(quint64 generation)
+{
+    if (generation != detectionGeneration_ || --detectionReadsPending_ != 0) return;
+    loadingDetection_ = false;
+    if (!detectionReadFailed_) setDetectionStatus(QStringLiteral("线位已读取"));
+    setDetectionBusy(false);
 }
 
 void LivePreviewPanel::setDetectionBusy(bool busy)

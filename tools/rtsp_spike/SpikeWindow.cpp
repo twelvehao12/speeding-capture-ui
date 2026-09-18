@@ -1,4 +1,5 @@
 #include "SpikeWindow.h"
+#include "../../src/services/UiPerformanceMonitor.h"
 
 #include "../../src/rv1126b/infrastructure/video/QtMultimediaRtspPlayer.h"
 
@@ -91,6 +92,7 @@ SpikeWindow::SpikeWindow(RtspSpikeOptions options, QWidget* parent)
     stream.flush();
 
     player_ = new rv1126b::QtMultimediaRtspPlayer(this);
+    new UiPerformanceMonitor(this);
     setupUi();
     connectPlayer();
 
@@ -265,6 +267,10 @@ void SpikeWindow::connectPlayer()
             });
     connect(player_, &rv1126b::QtMultimediaRtspPlayer::frameReceived, this, [this]() {
         ++statsForRole(currentRole_).frames;
+        if (frameIntervalTimer_.isValid()) {
+            if (frameIntervals_.size() < 2000) frameIntervals_.append(frameIntervalTimer_.restart());
+            else frameIntervalTimer_.restart();
+        } else frameIntervalTimer_.start();
     });
     connect(player_, &rv1126b::QtMultimediaRtspPlayer::streamMetadataReceived, this,
             [this](const QString& codec, const QSize& resolution, qreal frameRate) {
@@ -310,6 +316,8 @@ void SpikeWindow::play(rv1126b::RtspStreamRole role)
 
     currentRole_ = role;
     previousMetricFrames_ = statsForRole(role).frames;
+    frameIntervalTimer_.invalidate();
+    frameIntervals_.clear();
     metricElapsed_.restart();
     rv1126b::RtspStreamSpec stream;
     stream.deviceId = options_.deviceId;
@@ -376,12 +384,16 @@ void SpikeWindow::collectMetrics()
         stats.workingSetSamples.append(latestMetricSample_.workingSetMb);
     }
     writeEvent(QStringLiteral("metrics"),
-               QStringLiteral("fps=%1").arg(observedFps, 0, 'f', 2),
-               QStringLiteral("frames=%1").arg(stats.frames),
-               QStringLiteral("attempts=%1; successes=%2; reconnects=%3")
+               QStringLiteral("received_fps=%1").arg(observedFps, 0, 'f', 2),
+               QStringLiteral("received_frames=%1").arg(stats.frames),
+               QStringLiteral("attempts=%1; successes=%2; reconnects=%3;received_interval_p95_ms=%4;received_interval_max_ms=%5;renderer=%6;native_presentation_count=unavailable")
                    .arg(stats.attempts)
                    .arg(stats.successes)
-                   .arg(stats.reconnects));
+                   .arg(stats.reconnects)
+                   .arg(percentile(frameIntervals_, .95))
+                   .arg(frameIntervals_.isEmpty() ? -1 : *std::max_element(frameIntervals_.cbegin(), frameIntervals_.cend()))
+                   .arg(player_->outputWidget()->property("previewRenderer").toString()));
+    frameIntervals_.clear();
     updateStatusLabels();
 }
 
@@ -458,7 +470,7 @@ void SpikeWindow::updateStatusLabels()
     stateLabel_->setText(QStringLiteral("码流：%1    状态：%2    运行：%3 秒")
                              .arg(roleName(currentRole_), stateName(player_->state()))
                              .arg(runElapsed_.isValid() ? runElapsed_.elapsed() / 1000 : 0));
-    metricsLabel_->setText(QStringLiteral("冷启动：%1/%2    总尝试/成功：%3/%4    重连：%5    有效帧：%6")
+    metricsLabel_->setText(QStringLiteral("冷启动：%1/%2    总尝试/成功：%3/%4    重连：%5    收到帧：%6")
                                .arg(stats.coldStartSuccesses)
                                .arg(stats.coldStarts)
                                .arg(stats.successes)

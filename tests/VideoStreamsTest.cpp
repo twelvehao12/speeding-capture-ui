@@ -40,6 +40,19 @@ public:
     std::optional<ApiError> writeError;
     std::optional<ApiError> applyError;
     QVector<std::function<void()>> pending;
+    QVector<ApiCompletion<TriggerModeConfigDto>> modeReads;
+    QVector<ApiCompletion<LineRegionConfigDto>> lineReads;
+    QVector<ApiCompletion<TriggerModeConfigDto>> modeWrites;
+    int lineWrites = 0;
+
+    RequestId getTriggerModeConfig(QObject*, ApiCompletion<TriggerModeConfigDto> done) override
+    { modeReads.append(done); return RequestId::createUuid(); }
+    RequestId getLineRegionConfig(QObject*, ApiCompletion<LineRegionConfigDto> done) override
+    { lineReads.append(done); return RequestId::createUuid(); }
+    RequestId putTriggerModeConfig(const TriggerModeUpdate&, QObject*, ApiCompletion<TriggerModeConfigDto> done) override
+    { modeWrites.append(done); return RequestId::createUuid(); }
+    RequestId putLineRegionConfig(const LineRegionUpdate&, QObject*, ApiCompletion<LineRegionConfigDto>) override
+    { ++lineWrites; return RequestId::createUuid(); }
 
     RequestId getVideoStreamsConfig(QObject*, ApiCompletion<VideoStreamsConfigDto> done) override
     {
@@ -131,6 +144,7 @@ private slots:
     void verificationRetriesAreBounded();
     void destroyingApiResetsState();
     void uiSeparatesRoleDraftsAndShowsActualResolution();
+    void detectionWaitsForBothReadsAndIgnoresOldDeviceCallbacks();
 };
 
 void VideoStreamsTest::draftsAndFixedResolutionMigration()
@@ -384,6 +398,57 @@ void VideoStreamsTest::uiSeparatesRoleDraftsAndShowsActualResolution()
     panel.setBoardApiClient(&api, true);
     QCOMPARE(api.reads, readsBeforeDisconnect + 1);
     QVERIFY(codec->isEnabled());
+}
+
+void VideoStreamsTest::detectionWaitsForBothReadsAndIgnoresOldDeviceCallbacks()
+{
+    FakeApi a, b;
+    LivePreviewPanel panel(nullptr);
+    panel.setCurrentDevice(QStringLiteral("a"));
+    panel.setBoardApiClient(&a);
+    auto* modes = panel.findChild<QComboBox*>(QStringLiteral("triggerModeCombo"));
+    auto* save = panel.findChild<QPushButton*>(QStringLiteral("saveLineRegionButton"));
+    QVERIFY(modes && save);
+    TriggerModeConfigDto mode;
+    mode.revision = QStringLiteral("a1");
+    mode.triggerMode = QStringLiteral("line");
+    mode.supportedModes = {QStringLiteral("line"), QStringLiteral("radar")};
+    mode.writeEnabled = true;
+    LineRegionConfigDto line;
+    line.revision = QStringLiteral("a1");
+    line.writeEnabled = true;
+    QCOMPARE(a.modeReads.size(), 1);
+    a.modeReads.first()(ApiResult<TriggerModeConfigDto>::success(mode));
+    QVERIFY(!modes->isEnabled());
+    a.lineReads.first()(ApiResult<LineRegionConfigDto>::success(line));
+    QVERIFY(modes->isEnabled());
+    modes->setCurrentIndex(1);
+    QVERIFY(save->isEnabled());
+    save->click();
+    QCOMPARE(a.modeWrites.size(), 1);
+    panel.setCurrentDevice(QStringLiteral("b"));
+    panel.setBoardApiClient(&b);
+    mode.revision = QStringLiteral("b1");
+    mode.triggerMode = QStringLiteral("radar");
+    b.modeReads.first()(ApiResult<TriggerModeConfigDto>::success(mode));
+    QVERIFY(!modes->isEnabled());
+    b.lineReads.first()(ApiResult<LineRegionConfigDto>::success(line));
+    QVERIFY(modes->isEnabled());
+    mode.triggerMode = QStringLiteral("line");
+    a.modeWrites.first()(ApiResult<TriggerModeConfigDto>::success(mode));
+    a.modeReads.first()(ApiResult<TriggerModeConfigDto>::success(mode));
+    a.lineReads.first()(ApiResult<LineRegionConfigDto>::success(line));
+    QCOMPARE(modes->currentData().toString(), QStringLiteral("radar"));
+    QCOMPARE(b.lineWrites, 0);
+    QCOMPARE(b.applies, 0);
+    auto* closing = new LivePreviewPanel(nullptr);
+    closing->setCurrentDevice(QStringLiteral("a"));
+    closing->setBoardApiClient(&a);
+    const auto lateMode = a.modeReads.last();
+    const auto lateLine = a.lineReads.last();
+    delete closing;
+    lateMode(ApiResult<TriggerModeConfigDto>::success(mode));
+    lateLine(ApiResult<LineRegionConfigDto>::success(line));
 }
 
 QTEST_MAIN(VideoStreamsTest)

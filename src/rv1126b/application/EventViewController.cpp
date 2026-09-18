@@ -5,6 +5,7 @@
 #include <QFileInfo>
 #include <QSharedPointer>
 #include <QTextStream>
+#include <QSaveFile>
 
 #include <algorithm>
 
@@ -66,10 +67,60 @@ bool sameRemoteImageUrl(const QString& left, const QString& right)
 
 } // namespace
 
+class CsvExportWriter final : public QObject
+{
+public:
+    QString begin(const QString& path)
+    {
+        file_.reset();
+        if (!QDir().mkpath(QFileInfo(path).absolutePath())) return QStringLiteral("无法创建导出目录");
+        file_ = std::make_unique<QSaveFile>(path);
+        if (!file_->open(QIODevice::WriteOnly)) return file_->errorString();
+        file_->write("\xEF\xBB\xBF", 3);
+        file_->write("device_id,event_id,track_id,epoch_ms,source_epoch_ms,offset_applied_ms,time_quality,ocr_status,plate,plate_color,speed_kmh,speed_valid,direction,evidence_status\n");
+        return {};
+    }
+    QString append(const QVector<VehicleEvent>& events)
+    {
+        if (!file_) return QStringLiteral("导出已取消");
+        QTextStream out(file_.get());
+        out.setEncoding(QStringConverter::Utf8);
+        for (const auto& event : events) {
+            const QStringList values {
+                event.identity.deviceId, QString::number(event.identity.eventId), QString::number(event.identity.trackId),
+                QString::number(event.eventTime.epochMs), QString::number(event.eventTime.sourceEpochMs),
+                QString::number(event.eventTime.offsetAppliedMs), timeQualityText(event.eventTime.quality.value),
+                ocrStatusText(event.ocrStatus), event.plateText, event.plateColor, QString::number(event.speedKmh),
+                event.speedValid ? QStringLiteral("true") : QStringLiteral("false"),
+                event.motionDirection, event.evidenceStatus
+            };
+            QStringList escaped;
+            for (const auto& value : values) escaped.append(csvEscape(value));
+            out << escaped.join(',') << '\n';
+        }
+        out.flush();
+        return out.status() == QTextStream::Ok && file_->error() == QFileDevice::NoError
+            ? QString() : file_->errorString();
+    }
+    QString finish()
+    {
+        if (!file_) return QStringLiteral("导出已取消");
+        const bool ok = file_->commit();
+        const QString error = ok ? QString() : file_->errorString();
+        file_.reset();
+        return error;
+    }
+    void cancel() { file_.reset(); }
+private:
+    std::unique_ptr<QSaveFile> file_;
+};
 EventViewController::EventViewController(EventViewDependencies dependencies, QObject* parent)
     : QObject(parent)
     , dependencies_(dependencies)
 {
+    changeTimer_.setSingleShot(true);
+    changeTimer_.setInterval(100);
+    connect(&changeTimer_, &QTimer::timeout, this, &EventViewController::flushEventChanges);
     if (dependencies_.evidenceCache) {
         connect(dependencies_.evidenceCache, &EvidenceCache::stateChanged,
                 this, &EventViewController::evidenceChanged);
@@ -83,6 +134,8 @@ EventViewController::EventViewController(EventViewDependencies dependencies, QOb
 EventViewController::~EventViewController()
 {
     shutdown();
+    exportThread_.quit();
+    exportThread_.wait();
 }
 
 bool EventViewController::servicesAvailable() const
@@ -177,6 +230,8 @@ void EventViewController::queryHistory(const EventQuery& query)
     }
     currentQuery_ = query;
     realtimeMode_ = false;
+    changeTimer_.stop();
+    pendingEvents_.clear();
     const quint64 generation = ++queryGeneration_;
     if (!activeListRequest_.isNull()) {
         dependencies_.repository->cancel(activeListRequest_);
@@ -294,6 +349,7 @@ void EventViewController::deleteLocalEvent(const VehicleEvent& event)
                         emit deleteFinished(0, 1);
                         return;
                     }
+                    pendingEvents_.remove(event.identity);
                     emit eventDeleted(event.identity);
                     emit deleteFinished(1, 0);
                 });
@@ -309,6 +365,9 @@ void EventViewController::clearLocalHistory(const EventQuery& query)
         return;
     }
     clearRunning_ = true;
+    ++clearGeneration_;
+    clearContext_ = new QObject(this);
+    emit bulkProgress(QStringLiteral("clear"), 0);
     clearQuery_ = query;
     clearQuery_.limit = HistoryPageSize;
     clearQuery_.offset = 0;
@@ -322,14 +381,17 @@ void EventViewController::clearLocalHistory(const EventQuery& query)
         service->stop();
         clearPausedServices_.append(service);
     }
-    startClearBatch();
+    QTimer::singleShot(0, clearContext_, [this] { startClearBatch(); });
 }
 
 void EventViewController::startClearBatch()
 {
+    if (!clearRunning_ || shutdown_) return;
+    const auto generation = clearGeneration_;
     clearQuery_.offset = clearSkippedCount_;
     dependencies_.repository->queryEvents(
-        clearQuery_, this, [this](ApiResult<QVector<VehicleEvent>> result) {
+        clearQuery_, clearContext_, [this, generation](ApiResult<QVector<VehicleEvent>> result) {
+            if (generation != clearGeneration_ || !clearRunning_) return;
             if (!result) {
                 reportError(result.error(), QStringLiteral("读取待清空事件失败"));
                 ++clearFailedCount_;
@@ -341,47 +403,57 @@ void EventViewController::startClearBatch()
                 finishClear();
                 return;
             }
-            deleteNextClearEvent();
+            QTimer::singleShot(0, clearContext_, [this] { deleteNextClearEvent(); });
         });
 }
 
 void EventViewController::finishClear()
 {
+    const bool cancelled = !clearContext_;
     clearRunning_ = false;
+    delete clearContext_.data();
     if (!shutdown_) {
         for (EventSyncService* service : std::as_const(clearPausedServices_)) {
             if (service) service->start();
         }
     }
     clearPausedServices_.clear();
+    emit bulkFinished(QStringLiteral("clear"), cancelled);
     emit deleteFinished(clearDeletedCount_, clearFailedCount_);
 }
 
 void EventViewController::deleteNextClearEvent()
 {
+    if (!clearRunning_ || shutdown_) return;
+    const auto generation = clearGeneration_;
     if (clearQueue_.isEmpty()) {
-        startClearBatch();
+        QTimer::singleShot(0, clearContext_, [this] { startClearBatch(); });
         return;
     }
     const VehicleEvent event = clearQueue_.takeFirst();
     dependencies_.evidenceCache->removeLocal(
-        event, this, [this, event](ApiResult<void> cacheResult) {
+        event, clearContext_, [this, event, generation](ApiResult<void> cacheResult) {
+            if (generation != clearGeneration_ || !clearRunning_) return;
             if (!cacheResult) {
                 ++clearFailedCount_;
                 ++clearSkippedCount_;
-                deleteNextClearEvent();
+                QTimer::singleShot(0, clearContext_, [this] { deleteNextClearEvent(); });
                 return;
             }
             dependencies_.repository->deleteEvent(
-                event.identity, this, [this, event](ApiResult<void> result) {
+                event.identity, clearContext_, [this, event, generation](ApiResult<void> result) {
+                    if (generation != clearGeneration_ || !clearRunning_) return;
                     if (result) {
                         ++clearDeletedCount_;
+                        pendingEvents_.remove(event.identity);
                         emit eventDeleted(event.identity);
                     } else {
                         ++clearFailedCount_;
                         ++clearSkippedCount_;
                     }
-                    deleteNextClearEvent();
+                    emit bulkProgress(QStringLiteral("clear"), clearDeletedCount_ + clearFailedCount_);
+                    if (generation != clearGeneration_ || !clearRunning_) return;
+                    QTimer::singleShot(0, clearContext_, [this] { deleteNextClearEvent(); });
                 });
         });
 }
@@ -390,74 +462,115 @@ void EventViewController::exportHistory(const EventQuery& query, const QString& 
 {
     if (!dependencies_.repository || shutdown_ || exportRunning_ || filePath.isEmpty()) return;
     if (query.startEpochMs && query.endEpochMs && *query.startEpochMs >= *query.endEpochMs) {
-        emit userError(QStringLiteral("invalid_time_range"),
-                       QStringLiteral("导出范围的开始时间必须早于结束时间"));
+        emit userError(QStringLiteral("invalid_time_range"), QStringLiteral("导出范围的开始时间必须早于结束时间"));
         return;
     }
+    if (!exportWriter_) {
+        exportWriter_ = new CsvExportWriter;
+        exportWriter_->moveToThread(&exportThread_);
+        exportThread_.setObjectName(QStringLiteral("event-csv-export"));
+        connect(&exportThread_, &QThread::finished, exportWriter_, &QObject::deleteLater);
+        exportThread_.start();
+    }
     exportRunning_ = true;
+    const auto generation = ++exportGeneration_;
+    exportContext_ = new QObject(this);
     exportQuery_ = query;
     exportQuery_.limit = HistoryPageSize;
     exportQuery_.offset = 0;
-    exportRows_.clear();
+    exportRowCount_ = 0;
     exportPath_ = filePath;
-    startExportPage();
+    emit bulkProgress(QStringLiteral("export"), 0);
+    QMetaObject::invokeMethod(exportWriter_, [this, filePath, generation] {
+        const QString error = exportWriter_->begin(filePath);
+        QMetaObject::invokeMethod(this, [this, error, generation] {
+            if (generation != exportGeneration_ || !exportRunning_) return;
+            if (!error.isEmpty()) {
+                cancelExport();
+                emit userError(QStringLiteral("event_export_failed"), error);
+            } else startExportPage();
+        }, Qt::QueuedConnection);
+    }, Qt::QueuedConnection);
 }
 
 void EventViewController::startExportPage()
 {
-    dependencies_.repository->queryEvents(
-        exportQuery_, this, [this](ApiResult<QVector<VehicleEvent>> result) {
+    if (!exportRunning_ || shutdown_) return;
+    const auto generation = exportGeneration_;
+    dependencies_.repository->queryEvents(exportQuery_, exportContext_,
+        [this, generation](ApiResult<QVector<VehicleEvent>> result) {
+            if (generation != exportGeneration_ || !exportRunning_) return;
             if (!result) {
-                exportRunning_ = false;
+                cancelExport();
                 reportError(result.error(), QStringLiteral("导出查询失败"));
                 return;
             }
-            exportRows_ += result.value();
-            if (result.value().size() < exportQuery_.limit) {
-                finishExport();
-                return;
-            }
-            exportQuery_.offset += exportQuery_.limit;
-            startExportPage();
+            const auto events = result.value();
+            QMetaObject::invokeMethod(exportWriter_, [this, events, generation] {
+                const QString error = exportWriter_->append(events);
+                QMetaObject::invokeMethod(this, [this, error, count = events.size(), generation] {
+                    if (generation != exportGeneration_ || !exportRunning_) return;
+                    if (!error.isEmpty()) {
+                        cancelExport();
+                        emit userError(QStringLiteral("event_export_failed"), error);
+                        return;
+                    }
+                    exportRowCount_ += count;
+                    emit bulkProgress(QStringLiteral("export"), exportRowCount_);
+                    if (generation != exportGeneration_ || !exportRunning_) return;
+                    if (count < exportQuery_.limit) finishExport();
+                    else {
+                        exportQuery_.offset += count;
+                        QTimer::singleShot(0, exportContext_, [this] { startExportPage(); });
+                    }
+                }, Qt::QueuedConnection);
+            }, Qt::QueuedConnection);
         });
 }
 
 void EventViewController::finishExport()
 {
-    QDir().mkpath(QFileInfo(exportPath_).absolutePath());
-    QFile file(exportPath_);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        exportRunning_ = false;
-        emit userError(QStringLiteral("event_export_failed"), file.errorString());
-        return;
-    }
-    file.write("\xEF\xBB\xBF", 3);
-    QTextStream out(&file);
-    out.setEncoding(QStringConverter::Utf8);
-    out << QStringLiteral("device_id,event_id,track_id,epoch_ms,source_epoch_ms,offset_applied_ms,time_quality,ocr_status,plate,plate_color,speed_kmh,speed_valid,direction,evidence_status\n");
-    for (const VehicleEvent& event : std::as_const(exportRows_)) {
-        const QStringList values {
-            event.identity.deviceId,
-            QString::number(event.identity.eventId),
-            QString::number(event.identity.trackId),
-            QString::number(event.eventTime.epochMs),
-            QString::number(event.eventTime.sourceEpochMs),
-            QString::number(event.eventTime.offsetAppliedMs),
-            timeQualityText(event.eventTime.quality.value),
-            ocrStatusText(event.ocrStatus), event.plateText, event.plateColor,
-            QString::number(event.speedKmh), event.speedValid ? QStringLiteral("true") : QStringLiteral("false"),
-            event.motionDirection, event.evidenceStatus
-        };
-        QStringList escaped;
-        for (const QString& value : values) escaped.append(csvEscape(value));
-        out << escaped.join(QLatin1Char(',')) << QLatin1Char('\n');
-    }
-    out.flush();
-    const int count = exportRows_.size();
-    exportRunning_ = false;
-    emit exportFinished(exportPath_, count);
+    const auto generation = exportGeneration_;
+    QMetaObject::invokeMethod(exportWriter_, [this, generation] {
+        const QString error = exportWriter_->finish();
+        QMetaObject::invokeMethod(this, [this, generation, error] {
+            if (generation != exportGeneration_ || !exportRunning_) return;
+            exportRunning_ = false;
+            delete exportContext_.data();
+            emit bulkFinished(QStringLiteral("export"), false);
+            if (error.isEmpty()) emit exportFinished(exportPath_, exportRowCount_);
+            else emit userError(QStringLiteral("event_export_failed"), error);
+        }, Qt::QueuedConnection);
+    }, Qt::QueuedConnection);
 }
 
+void EventViewController::cancelExport()
+{
+    if (!exportRunning_) return;
+    ++exportGeneration_;
+    exportRunning_ = false;
+    delete exportContext_.data();
+    if (exportWriter_) QMetaObject::invokeMethod(exportWriter_, [writer = exportWriter_] { writer->cancel(); }, Qt::QueuedConnection);
+    emit bulkFinished(QStringLiteral("export"), true);
+}
+
+void EventViewController::cancelClear()
+{
+    if (!clearRunning_) return;
+    ++clearGeneration_;
+    delete clearContext_.data();
+    clearQueue_.clear();
+    finishClear();
+}
+
+void EventViewController::flushEventChanges()
+{
+    const auto events = pendingEvents_.values();
+    pendingEvents_.clear();
+    if (shutdown_ || paused_ || !realtimeMode_) return;
+    emit eventsUpserted(events);
+    for (const auto& event : events) emit eventUpserted(event);
+}
 void EventViewController::stopDevice(const QString& deviceId)
 {
     if (EventSyncService* service = syncServices_.value(deviceId)) service->stop();
@@ -469,6 +582,10 @@ void EventViewController::shutdown()
 {
     if (shutdown_) return;
     shutdown_ = true;
+    changeTimer_.stop();
+    pendingEvents_.clear();
+    cancelClear();
+    cancelExport();
     ++queryGeneration_;
     for (EventSyncService* service : std::as_const(syncServices_)) {
         if (service) service->stop();
@@ -497,6 +614,7 @@ void EventViewController::loadChangedEvent(const EventIdentity& identity)
         identity, this, [this, holder, completed](ApiResult<std::optional<VehicleEvent>> result) {
             *completed = true;
             if (!holder->isNull()) activeRequests_.remove(*holder);
+            if (shutdown_) return;
             if (!result) {
                 reportError(result.error(), QStringLiteral("刷新事件失败"));
                 return;
@@ -511,7 +629,8 @@ void EventViewController::loadChangedEvent(const EventIdentity& identity)
                 ++pendingChangeCount_;
                 emit pendingChangeCountChanged(pendingChangeCount_);
             } else if (realtimeMode_ && matchesCurrentQuery(event)) {
-                emit eventUpserted(event);
+                pendingEvents_.insert(event.identity, event);
+                if (!changeTimer_.isActive()) changeTimer_.start();
             }
         });
     *holder = id;

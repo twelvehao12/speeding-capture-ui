@@ -2,23 +2,18 @@
 
 #include "../ports/IEventRepository.h"
 
-#include <QHash>
-#include <QPointer>
-#include <QThread>
-#include <atomic>
-#include <memory>
+#include <QSqlDatabase>
+#include <QSqlQuery>
 #include <QString>
 
 namespace rv1126b {
 
-class SqliteEventStore;
-
-class SqliteEventRepository final : public IEventRepository
+class SqliteEventStore final : public IEventRepository
 {
 public:
-    explicit SqliteEventRepository(QObject* parent = nullptr);
-    explicit SqliteEventRepository(const QString& databasePath, QObject* parent = nullptr);
-    ~SqliteEventRepository() override;
+    explicit SqliteEventStore(QObject* parent = nullptr);
+    explicit SqliteEventStore(const QString& databasePath, QObject* parent = nullptr);
+    ~SqliteEventStore() override;
 
     RequestId initialize(QObject* context, ApiCompletion<void> completion) override;
     RequestId upsertDevice(
@@ -89,47 +84,43 @@ public:
         ApiCompletion<QVector<VehicleEvent>> completion) override;
 
 private:
-    struct Pending {
-        std::atomic_bool cancelled{false};
-        QMetaObject::Connection contextDestroyed;
-    };
+    bool openDatabase(QString* errorMessage);
+    bool ensureSchema(QString* errorMessage);
+    bool migrateEventSchema(QString* errorMessage);
+    bool migrateEvidenceCacheSchema(QString* errorMessage);
+    bool execSql(const QString& sql, QString* errorMessage);
+    bool beginTransaction(QString* errorMessage);
+    bool commitTransaction(QString* errorMessage);
+    void rollbackTransaction();
 
-    template<typename T, typename Work>
-    RequestId submit(QObject* context, ApiCompletion<T> completion, Work work)
+    ApiError storageError(const QString& message) const;
+
+    bool upsertDeviceInternal(const DeviceProfile& profile, QString* errorMessage);
+    bool upsertEventInternal(const VehicleEvent& event, QString* errorMessage);
+    bool saveEvidenceStateInternal(const EvidenceCacheEntry& evidence, QString* errorMessage);
+    bool saveFtpTaskSnapshotInternal(const StoredFtpTask& task, QString* errorMessage);
+    bool loadFtpTaskTargets(StoredFtpTask* task, QString* errorMessage) const;
+
+    DeviceProfile deviceProfileFromQuery(const QSqlQuery& query) const;
+    VehicleEvent eventFromQuery(const QSqlQuery& query) const;
+    EvidenceCacheEntry evidenceFromQuery(const QSqlQuery& query) const;
+    StoredFtpTask ftpTaskFromQuery(const QSqlQuery& query) const;
+    StoredFtpTargetStatus ftpTargetFromQuery(const QSqlQuery& query) const;
+
+    template<typename T>
+    RequestId finish(QObject* context, ApiCompletion<T> completion, ApiResult<T> result)
     {
-        Q_ASSERT(QThread::currentThread() == thread());
-        const RequestId id = RequestId::createUuid();
-        const auto pending = std::make_shared<Pending>();
-        pending_.insert(id, pending);
-        QPointer<QObject> target(context ? context : this);
-        if (context) pending->contextDestroyed = connect(context, &QObject::destroyed, this,
-            [this, id] { cancel(id); });
-        setProperty("pendingRequestCount", pending_.size());
-        QMetaObject::invokeMethod(worker_, [this, id, pending, target,
-                                          completion = std::move(completion), work = std::move(work)]() mutable {
-            if (pending->cancelled) return;
-            work([this, id, pending, target, completion = std::move(completion)](ApiResult<T> result) mutable {
-                if (pending->cancelled) return;
-                QMetaObject::invokeMethod(this, [this, id, pending, target,
-                                                completion = std::move(completion), result = std::move(result)]() mutable {
-                    disconnect(pending->contextDestroyed);
-                    pending_.remove(id);
-                    setProperty("pendingRequestCount", pending_.size());
-                    if (pending->cancelled || !target || !completion) return;
-                    QMetaObject::invokeMethod(target, [pending, completion = std::move(completion),
-                                                      result = std::move(result)]() mutable {
-                        if (!pending->cancelled) completion(std::move(result));
-                    }, Qt::AutoConnection);
-                }, Qt::QueuedConnection);
-            });
-        }, Qt::QueuedConnection);
-        return id;
+        Q_UNUSED(context)
+        const RequestId requestId = RequestId::createUuid();
+        if (completion) {
+            completion(std::move(result));
+        }
+        return requestId;
     }
 
-    QThread workerThread_;
-    QObject* worker_ = nullptr;
-    SqliteEventStore* store_ = nullptr;
-    QHash<RequestId, std::shared_ptr<Pending>> pending_;
+    QString databasePath_;
+    QString connectionName_;
+    QSqlDatabase database_;
 };
 
 } // namespace rv1126b

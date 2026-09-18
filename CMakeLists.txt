@@ -38,6 +38,10 @@ qt_add_executable(CameraManagerApp
     ${VIDEO_STREAMS_CONTROLLER_SOURCES}
     ${RTSP_PLAYER_SOURCES}
     src/main.cpp
+    src/services/UiPerformanceMonitor.h
+    src/rv1126b/network/FileDownloadExecutor.h
+    src/rv1126b/services/CacheFileLease.h
+    src/rv1126b/storage/SqliteEventStore.h
     src/device/IDeviceClient.cpp
     src/device/IDeviceClient.h
     src/device/MockDeviceClient.cpp
@@ -95,6 +99,7 @@ qt_add_executable(CameraManagerApp
     src/rv1126b/services/BoardFtpService.h
     src/rv1126b/services/EmbeddedFtpReceiveServer.cpp
     src/rv1126b/services/EmbeddedFtpReceiveServer.h
+    src/rv1126b/services/EmbeddedFtpReceiveWorker.h
     src/rv1126b/services/EventSyncService.h
     src/rv1126b/services/EvidenceCache.h
     src/rv1126b/services/EvidenceCacheMaintenanceService.cpp
@@ -501,6 +506,7 @@ qt_add_executable(DeviceOperationsUiTest
     src/rv1126b/services/BoardFtpTaskSnapshotService.cpp
     src/rv1126b/services/EmbeddedFtpReceiveServer.cpp
     src/rv1126b/services/EmbeddedFtpReceiveServer.h
+    src/rv1126b/services/EmbeddedFtpReceiveWorker.h
     src/rv1126b/application/DeviceOperationsController.h
     src/rv1126b/core/Result.h
     src/rv1126b/core/ValueTypes.h
@@ -676,6 +682,7 @@ qt_add_executable(EmbeddedFtpReceiveServerTest
     tests/EmbeddedFtpReceiveServerTest.cpp
     src/rv1126b/services/EmbeddedFtpReceiveServer.cpp
     src/rv1126b/services/EmbeddedFtpReceiveServer.h
+    src/rv1126b/services/EmbeddedFtpReceiveWorker.h
 )
 
 target_link_libraries(EmbeddedFtpReceiveServerTest
@@ -897,6 +904,7 @@ qt_add_executable(ApplicationRuntimeTest
     src/rv1126b/services/BoardFtpTaskSnapshotService.cpp
     src/rv1126b/services/EmbeddedFtpReceiveServer.cpp
     src/rv1126b/services/EmbeddedFtpReceiveServer.h
+    src/rv1126b/services/EmbeddedFtpReceiveWorker.h
     src/rv1126b/services/EvidenceCacheMaintenanceService.cpp
     src/rv1126b/services/DeviceDiscoveryService.h
     src/rv1126b/services/DeviceFleetService.h

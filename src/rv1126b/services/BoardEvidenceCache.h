@@ -1,6 +1,7 @@
 #pragma once
 
 #include "EvidenceCache.h"
+#include "CacheFileLease.h"
 
 #include "../ports/IBoardApiClient.h"
 #include "../ports/IEventRepository.h"
@@ -9,6 +10,7 @@
 #include <QPointer>
 #include <QSet>
 #include <QVector>
+#include <QTimer>
 
 #include <functional>
 
@@ -46,6 +48,7 @@ public:
     void cancelAll() override;
     QString finalPathFor(const VehicleEvent& event) const override;
     bool setCacheRootPath(const QString& cacheRootPath);
+    static constexpr int MaxQueuedDownloads = 256;
 
 private:
     struct ActiveDownload {
@@ -54,12 +57,17 @@ private:
         QString partFilePath;
         RequestId requestId;
         QPointer<IBoardApiClient> apiClient;
+        quint64 generation = 0;
+        std::shared_ptr<CacheFileLease> lease;
     };
 
     void drainQueue();
+    void enqueueAfterLookup(const VehicleEvent& event, quint64 generation,
+                            ApiResult<std::optional<EvidenceCacheEntry>> result);
+    void refillQueue();
     bool canStart(const VehicleEvent& event) const;
     void startDownload(const VehicleEvent& event);
-    void handleDownloadFinished(const EventIdentity& identity, ApiResult<EvidenceDownloadResult> result);
+    void handleDownloadFinished(const EventIdentity& identity, quint64 generation, ApiResult<EvidenceDownloadResult> result);
     void finishActive(const EventIdentity& identity);
     void scheduleRetry(const VehicleEvent& event);
     void cancelRetry(const EventIdentity& identity);
@@ -85,10 +93,19 @@ private:
     QString cacheRootPath_;
     QVector<VehicleEvent> queue_;
     QSet<EventIdentity> queuedIdentities_;
-    QSet<EventIdentity> scheduledRetries_;
+    QHash<EventIdentity, quint64> scheduledRetries_;
     QHash<EventIdentity, ActiveDownload> active_;
     QHash<QString, int> activePerDevice_;
     QHash<EventIdentity, int> retryAttempts_;
+    QHash<EventIdentity, quint64> lookups_;
+    QHash<EventIdentity, quint64> stateNotifications_;
+    QSet<QString> suspendedDevices_;
+    QSet<QString> eligibleDevices_;
+    QTimer refillTimer_;
+    quint64 nextGeneration_ = 0;
+    quint64 refillGeneration_ = 0;
+    bool refillPending_ = false;
+    bool stopped_ = false;
 };
 
 } // namespace rv1126b

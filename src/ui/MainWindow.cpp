@@ -38,6 +38,7 @@
 #include <QMessageBox>
 #include <QPoint>
 #include <QProcess>
+#include <QProgressDialog>
 #include <QSize>
 #include <QSortFilterProxyModel>
 #include <QSpinBox>
@@ -122,6 +123,11 @@ MainWindow::MainWindow(MainWindowDependencies dependencies, QWidget *parent)
     createCentralLayout();
     createDeviceContextMenu();
     createStatusBar();
+    if (evidenceMaintenance_) connect(evidenceMaintenance_, &rv1126b::EvidenceCacheMaintenanceService::cleanupFinished,
+        this, [this](const rv1126b::EvidenceCacheCleanupResult& result) {
+            statusBar()->showMessage(QStringLiteral("图片缓存维护完成：删除 %1 个文件，释放 %2 MB")
+                .arg(result.deletedFiles).arg(result.deletedBytes / 1024 / 1024), 4000);
+        });
     applySystemSettings(true);
 
     if (captureService_)
@@ -436,11 +442,10 @@ void MainWindow::connectEventController()
                 pendingCaptureCount_ = 0;
                 if (snapshotPreview_) snapshotPreview_->clearVehicleEvent();
                 updateCaptureControls(); });
-    connect(eventController_, &rv1126b::EventViewController::eventUpserted,
-            this, [this](const rv1126b::VehicleEvent &event)
+    connect(eventController_, &rv1126b::EventViewController::eventsUpserted,
+            this, [this](const QVector<rv1126b::VehicleEvent>& events)
             {
-                captureModel_->upsertVehicleEvent(
-                    event, currentSystemSettings_.ui.captureListMaxRows);
+                captureModel_->upsertVehicleEvents(events, currentSystemSettings_.ui.captureListMaxRows);
                 updateCaptureControls(); });
     connect(eventController_, &rv1126b::EventViewController::eventDeleted,
             this, [this](const rv1126b::EventIdentity &identity)
@@ -479,6 +484,29 @@ void MainWindow::connectEventController()
     connect(eventController_, &rv1126b::EventViewController::exportFinished,
             this, [this](const QString &path, int count)
             { statusBar()->showMessage(QStringLiteral("已导出 %1 条真实事件：%2").arg(count).arg(path), 5000); });
+    connect(eventController_, &rv1126b::EventViewController::bulkProgress, this,
+        [this](const QString& operation, int completed) {
+            auto dialog = bulkDialogs_.value(operation);
+            if (!dialog) {
+                dialog = new QProgressDialog(this);
+                dialog->setWindowTitle(operation == QLatin1String("export") ? QStringLiteral("导出记录") : QStringLiteral("清空记录"));
+                dialog->setCancelButtonText(QStringLiteral("取消"));
+                dialog->setRange(0, 0);
+                dialog->setMinimumDuration(500);
+                dialog->setValue(0);
+                bulkDialogs_.insert(operation, dialog);
+                connect(dialog, &QProgressDialog::canceled, this, [this, operation] {
+                    if (operation == QLatin1String("export")) eventController_->cancelExport();
+                    else eventController_->cancelClear();
+                });
+            }
+            if (completed % 100 == 0) dialog->setLabelText(QStringLiteral("已处理 %1 条记录").arg(completed));
+        });
+    connect(eventController_, &rv1126b::EventViewController::bulkFinished, this,
+        [this](const QString& operation, bool cancelled) {
+            if (auto dialog = bulkDialogs_.take(operation)) { dialog->hide(); dialog->deleteLater(); }
+            if (cancelled) statusBar()->showMessage(QStringLiteral("操作已取消，已完成的处理保留"), 4000);
+        });
     connect(eventController_, &rv1126b::EventViewController::userError,
             this, &MainWindow::handleIntegrationError);
     connect(eventController_, &rv1126b::EventViewController::syncHealthy,
@@ -678,17 +706,9 @@ void MainWindow::performDiskMaintenance()
 
     if (!mockMode_ && evidenceMaintenance_)
     {
-        const auto result = evidenceMaintenance_->cleanup(
+        evidenceMaintenance_->cleanupAsync(
             rv1126b::EvidenceCacheCleanupPolicy::fromMaintenanceSettings(
                 currentSystemSettings_.maintenance));
-        if (result.deletedFiles > 0)
-        {
-            statusBar()->showMessage(
-                QStringLiteral("图片缓存维护已删除 %1 个文件，释放 %2 MB")
-                    .arg(result.deletedFiles)
-                    .arg(result.deletedBytes / 1024 / 1024),
-                4000);
-        }
         return;
     }
 
@@ -943,8 +963,10 @@ QTableView *MainWindow::createCaptureTable(QSortFilterProxyModel *proxyModel)
     auto *table = new QTableView(this);
     table->setModel(proxyModel);
     configureTableView(table);
-    table->horizontalHeader()->setSectionResizeMode(CaptureRecordTableModel::TimeColumn, QHeaderView::ResizeToContents);
-    table->horizontalHeader()->setSectionResizeMode(CaptureRecordTableModel::CoordinateColumn, QHeaderView::ResizeToContents);
+    table->horizontalHeader()->setSectionResizeMode(CaptureRecordTableModel::TimeColumn, QHeaderView::Interactive);
+    table->horizontalHeader()->setSectionResizeMode(CaptureRecordTableModel::CoordinateColumn, QHeaderView::Interactive);
+    table->setColumnWidth(CaptureRecordTableModel::TimeColumn, 185);
+    table->setColumnWidth(CaptureRecordTableModel::CoordinateColumn, 130);
 
     connect(table->selectionModel(), &QItemSelectionModel::currentRowChanged, this, [this]()
             {

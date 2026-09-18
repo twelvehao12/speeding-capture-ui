@@ -22,6 +22,16 @@ public:
     RequestId queryEvents(const EventQuery& query, QObject*, ApiCompletion<QVector<VehicleEvent>> c) override
     {
         ++queryCount;
+        if (syntheticCount >= 0) {
+            QVector<VehicleEvent> page;
+            for (int i = query.offset; i < qMin(syntheticCount, query.offset + query.limit); ++i) {
+                VehicleEvent row;
+                row.identity = {QStringLiteral("stress"), syntheticCount - i, 1};
+                page.append(row);
+            }
+            maxPageSize = qMax(maxPageSize, int(page.size()));
+            return value(std::move(c), page);
+        }
         QVector<VehicleEvent> rows;
         for (const VehicleEvent& event : events) {
             if (query.deviceId && event.identity.deviceId != *query.deviceId) continue;
@@ -48,6 +58,7 @@ public:
 
     RequestId deleteEvent(const EventIdentity& identity, QObject*, ApiCompletion<void> c) override
     {
+        if (syntheticCount >= 0) { --syntheticCount; return done(std::move(c)); }
         for (int i = 0; i < events.size(); ++i) {
             if (events.at(i).identity == identity) {
                 events.removeAt(i);
@@ -94,6 +105,8 @@ public:
     int queryCount = 0;
     int cancelCount = 0;
     int cancelAllCount = 0;
+    int syntheticCount = -1;
+    int maxPageSize = 0;
 };
 
 class FakeEvidenceCache final : public EvidenceCache
@@ -160,6 +173,8 @@ private slots:
     void deleteAndClearPreserveRowsWhenImageRemovalFails();
     void exportUsesAllPagesAndContainsCompositeIdentity();
     void disconnectAndShutdownReleaseResources();
+    void hundredThousandRowsExportAndClearInBoundedBatches();
+    void bulkCancellationDiscardsPartialExportAndStopsClear();
 
 private:
     static VehicleEvent event(QString device, qint64 eventId, qint64 trackId,
@@ -198,7 +213,7 @@ void EventViewControllerTest::exactChangesUpsertAndCacheEvidence()
     repository.events[0].evidenceAvailable = true;
     sync.change(queued.identity);
 
-    QCOMPARE(upsertSpy.size(), 1);
+    QTRY_COMPARE(upsertSpy.size(), 1);
     QCOMPARE(upsertSpy.takeFirst().at(0).value<VehicleEvent>().plateText, QStringLiteral("粤B12345"));
     QCOMPARE(cache.enqueued.size(), 1);
 }
@@ -249,9 +264,9 @@ void EventViewControllerTest::deleteAndClearPreserveRowsWhenImageRemovalFails()
     EventQuery query;
     query.deviceId = QStringLiteral("dev-a");
     controller.clearLocalHistory(query);
-    QCOMPARE(repository.events.size(), 1);
+    QTRY_COMPARE(repository.events.size(), 1);
     QCOMPARE(repository.events.first().identity, first.identity);
-    QVERIFY(finishedSpy.size() >= 1);
+    QTRY_VERIFY(finishedSpy.size() >= 1);
     const QList<QVariant> result = finishedSpy.takeLast();
     QCOMPARE(result.at(0).toInt(), 1);
     QCOMPARE(result.at(1).toInt(), 1);
@@ -268,7 +283,7 @@ void EventViewControllerTest::exportUsesAllPagesAndContainsCompositeIdentity()
     const QString path = dir.filePath(QStringLiteral("events.csv"));
     QSignalSpy exportSpy(&controller, &EventViewController::exportFinished);
     controller.exportHistory(EventQuery{}, path);
-    QCOMPARE(exportSpy.size(), 1);
+    QTRY_COMPARE(exportSpy.size(), 1);
     QCOMPARE(exportSpy.first().at(1).toInt(), 105);
     QFile file(path);
     QVERIFY(file.open(QIODevice::ReadOnly));
@@ -305,6 +320,66 @@ VehicleEvent EventViewControllerTest::event(QString device, qint64 eventId, qint
     value.eventTime.quality.value = TimeQuality::NativeUtc;
     value.ocrStatus.value = status;
     return value;
+}
+
+void EventViewControllerTest::hundredThousandRowsExportAndClearInBoundedBatches()
+{
+    FakeEventRepository repository;
+    repository.syntheticCount = 100000;
+    FakeEvidenceCache cache;
+    EventViewController controller({&repository, &cache});
+    QTemporaryDir dir;
+    const auto path = dir.filePath(QStringLiteral("stress.csv"));
+    QSignalSpy exported(&controller, &EventViewController::exportFinished);
+    controller.exportHistory(EventQuery{}, path);
+    QTRY_COMPARE_WITH_TIMEOUT(exported.size(), 1, 60000);
+    QCOMPARE(exported.first().at(1).toInt(), 100000);
+    QCOMPARE(repository.maxPageSize, 100);
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    int lines = 0;
+    while (!file.atEnd()) { file.readLine(); ++lines; }
+    QCOMPARE(lines, 100001);
+    int heartbeats = 0;
+    QTimer timer;
+    connect(&timer, &QTimer::timeout, this, [&] { ++heartbeats; });
+    timer.start(1);
+    QSignalSpy cleared(&controller, &EventViewController::deleteFinished);
+    controller.clearLocalHistory(EventQuery{});
+    QTRY_COMPARE_WITH_TIMEOUT(cleared.size(), 1, 60000);
+    QCOMPARE(repository.syntheticCount, 0);
+    QCOMPARE(cleared.first().at(0).toInt(), 100000);
+    QVERIFY(heartbeats > 0);
+}
+
+void EventViewControllerTest::bulkCancellationDiscardsPartialExportAndStopsClear()
+{
+    FakeEventRepository repository;
+    repository.syntheticCount = 100000;
+    FakeEvidenceCache cache;
+    EventViewController controller({&repository, &cache});
+    QTemporaryDir dir;
+    const auto path = dir.filePath(QStringLiteral("cancelled.csv"));
+    QFile existing(path);
+    QVERIFY(existing.open(QIODevice::WriteOnly));
+    existing.write("original");
+    existing.close();
+    connect(&controller, &EventViewController::bulkProgress, this, [&](const QString& operation, int count) {
+        if (count < 100) return;
+        if (operation == QStringLiteral("export")) controller.cancelExport();
+        else controller.cancelClear();
+    });
+    QSignalSpy finished(&controller, &EventViewController::bulkFinished);
+    controller.exportHistory(EventQuery{}, path);
+    QTRY_COMPARE(finished.size(), 1);
+    QVERIFY(finished.last().at(1).toBool());
+    QVERIFY(existing.open(QIODevice::ReadOnly));
+    QCOMPARE(existing.readAll(), QByteArrayLiteral("original"));
+    controller.clearLocalHistory(EventQuery{});
+    QTRY_COMPARE(finished.size(), 2);
+    QVERIFY(finished.last().at(1).toBool());
+    QTest::qWait(30);
+    QCOMPARE(repository.syntheticCount, 99900);
 }
 
 QTEST_MAIN(EventViewControllerTest)

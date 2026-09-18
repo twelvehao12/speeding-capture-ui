@@ -6,6 +6,9 @@
 #include <QString>
 
 #include <functional>
+#include <atomic>
+#include <memory>
+#include <QFutureWatcher>
 
 namespace rv1126b {
 
@@ -39,6 +42,12 @@ public:
     QString cacheRootPath() const;
     void setCacheRootPath(const QString& cacheRootPath);
     EvidenceCacheCleanupResult cleanup(const EvidenceCacheCleanupPolicy& policy) const;
+    ~EvidenceCacheMaintenanceService() override;
+    void cleanupAsync(const EvidenceCacheCleanupPolicy& policy);
+    void cancel();
+
+signals:
+    void cleanupFinished(rv1126b::EvidenceCacheCleanupResult result);
 
 private:
     struct CacheFile {
@@ -53,6 +62,8 @@ private:
 
     QString cacheRootPath_;
     std::function<qint64()> availableBytesProvider_;
+    std::shared_ptr<std::atomic_bool> cancelled_ = std::make_shared<std::atomic_bool>(false);
+    QFutureWatcher<EvidenceCacheCleanupResult>* watcher_ = nullptr;
 };
 
 } // namespace rv1126b

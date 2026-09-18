@@ -1,10 +1,13 @@
 #include "EvidenceCacheMaintenanceService.h"
+#include "CacheFileLease.h"
 
 #include <QDateTime>
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
 #include <QStorageInfo>
+#include <QPromise>
+#include <QThreadPool>
 
 #include <algorithm>
 
@@ -58,7 +61,40 @@ QString EvidenceCacheMaintenanceService::cacheRootPath() const
 
 void EvidenceCacheMaintenanceService::setCacheRootPath(const QString& cacheRootPath)
 {
+    if (watcher_) cancel();
+    else cancelled_ = std::make_shared<std::atomic_bool>(false);
     cacheRootPath_ = cacheRootPath;
+}
+
+EvidenceCacheMaintenanceService::~EvidenceCacheMaintenanceService() { if (watcher_) cancel(); }
+
+void EvidenceCacheMaintenanceService::cancel() { *cancelled_ = true; }
+
+void EvidenceCacheMaintenanceService::cleanupAsync(const EvidenceCacheCleanupPolicy& policy)
+{
+    if (watcher_) return;
+    cancelled_ = std::make_shared<std::atomic_bool>(false);
+    const auto cancelled = cancelled_;
+    const QString root = cacheRootPath_;
+    const auto available = availableBytesProvider_;
+    auto promise = std::make_shared<QPromise<EvidenceCacheCleanupResult>>();
+    auto* watcher = new QFutureWatcher<EvidenceCacheCleanupResult>(this);
+    watcher_ = watcher;
+    connect(watcher, &QFutureWatcher<EvidenceCacheCleanupResult>::finished, this, [this, watcher, cancelled] {
+        watcher_ = nullptr;
+        if (!*cancelled) emit cleanupFinished(watcher->result());
+        watcher->deleteLater();
+    });
+    promise->start();
+    watcher->setFuture(promise->future());
+    static QThreadPool maintenancePool;
+    maintenancePool.setMaxThreadCount(1);
+    maintenancePool.start([promise, root, available, policy, cancelled] {
+        EvidenceCacheMaintenanceService worker(root, available);
+        worker.cancelled_ = cancelled;
+        promise->addResult(worker.cleanup(policy));
+        promise->finish();
+    });
 }
 
 EvidenceCacheCleanupResult EvidenceCacheMaintenanceService::cleanup(
@@ -66,6 +102,7 @@ EvidenceCacheCleanupResult EvidenceCacheMaintenanceService::cleanup(
 {
     EvidenceCacheCleanupResult result;
     QVector<CacheFile> files = collectCacheFiles(&result);
+    if (*cancelled_) return result;
     std::sort(files.begin(), files.end(), [](const CacheFile& left, const CacheFile& right) {
         return left.lastModifiedEpochMs < right.lastModifiedEpochMs;
     });
@@ -75,6 +112,7 @@ EvidenceCacheCleanupResult EvidenceCacheMaintenanceService::cleanup(
     qint64 remainingBytes = result.scannedBytes;
 
     for (const CacheFile& file : files) {
+        if (*cancelled_) return result;
         if (file.lastModifiedEpochMs >= expireBefore) {
             continue;
         }
@@ -85,6 +123,7 @@ EvidenceCacheCleanupResult EvidenceCacheMaintenanceService::cleanup(
 
     if (policy.maxCacheBytes > 0 && remainingBytes > policy.maxCacheBytes) {
         for (const CacheFile& file : files) {
+            if (*cancelled_) return result;
             if (remainingBytes <= policy.maxCacheBytes) {
                 break;
             }
@@ -99,6 +138,7 @@ EvidenceCacheCleanupResult EvidenceCacheMaintenanceService::cleanup(
 
     if (policy.deleteOldestWhenLowSpace && policy.minFreeSpaceBytes > 0) {
         for (const CacheFile& file : files) {
+            if (*cancelled_) return result;
             if (availableBytes() >= policy.minFreeSpaceBytes) {
                 break;
             }
@@ -125,6 +165,7 @@ EvidenceCacheMaintenanceService::collectCacheFiles(EvidenceCacheCleanupResult* r
         QDir::Files | QDir::NoDotAndDotDot,
         QDirIterator::Subdirectories);
     while (iterator.hasNext()) {
+        if (*cancelled_) break;
         iterator.next();
         const QFileInfo info = iterator.fileInfo();
         if (!isCacheImage(info)) {
@@ -150,6 +191,8 @@ bool EvidenceCacheMaintenanceService::removeCacheFile(
     const CacheFile& file,
     EvidenceCacheCleanupResult* result) const
 {
+    const auto lease = CacheFileLease::acquire(file.path, true);
+    if (!lease || *cancelled_) return false;
     const qint64 size = QFileInfo(file.path).size();
     if (!QFile::remove(file.path)) {
         return false;

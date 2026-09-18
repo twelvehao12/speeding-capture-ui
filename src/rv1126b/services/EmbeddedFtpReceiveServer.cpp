@@ -1,4 +1,5 @@
-#include "EmbeddedFtpReceiveServer.h"
+#include "EmbeddedFtpReceiveWorker.h"
+#include "CacheFileLease.h"
 
 #include <QDir>
 #include <QFile>
@@ -51,12 +52,12 @@ QByteArray line(const QString& text)
 
 } // namespace
 
-class EmbeddedFtpReceiveServer::Session final : public QObject
+class EmbeddedFtpReceiveWorker::Session final : public QObject
 {
     Q_OBJECT
 
 public:
-    Session(EmbeddedFtpReceiveServer* owner, QTcpSocket* socket)
+    Session(EmbeddedFtpReceiveWorker* owner, QTcpSocket* socket)
         : QObject(owner)
         , owner_(owner)
         , control_(socket)
@@ -155,6 +156,7 @@ private:
         QString error;
         passiveServer_ = owner_->createPassiveServer(&error);
         if (!passiveServer_) return reply(425, error.isEmpty() ? QStringLiteral("Cannot open passive socket") : error);
+        passiveServer_->setParent(this);
 
         const quint16 port = passiveServer_->serverPort();
         if (extended) {
@@ -226,26 +228,36 @@ private:
         const QString target = owner_->resolvePath(cwd_, path, &ok, &relative);
         if (!ok || !QDir().mkpath(QFileInfo(target).absolutePath())) return reply(550, QStringLiteral("Invalid upload path"));
 
+        const auto lease = CacheFileLease::acquire(target);
+        if (!lease) return reply(450, QStringLiteral("Upload path is busy"));
         auto file = QSharedPointer<QFile>::create(target);
+        auto failed = QSharedPointer<bool>::create(false);
         if (!file->open(QIODevice::WriteOnly | QIODevice::Truncate)) return reply(550, QStringLiteral("Cannot open upload path"));
 
         QTcpServer* server = std::exchange(passiveServer_, nullptr);
-        connect(server, &QTcpServer::newConnection, this, [this, server, file, relative]() {
+        connect(server, &QTcpServer::newConnection, this, [this, server, file, relative, failed, lease]() {
             QTcpSocket* data = server->nextPendingConnection();
             server->close();
             server->deleteLater();
             if (!data) return;
             data->setParent(this);
-            connect(data, &QTcpSocket::readyRead, this, [data, file]() {
-                file->write(data->readAll());
-            });
-            connect(data, &QTcpSocket::disconnected, this, [this, data, file, relative]() {
-                file->flush();
+            data->setReadBufferSize(256 * 1024);
+            auto drain = [data, file, failed] {
+                while (data->bytesAvailable()) {
+                    const QByteArray block = data->read(64 * 1024);
+                    if (block.isEmpty()) break;
+                    if (file->write(block) != block.size()) *failed = true;
+                }
+            };
+            connect(data, &QTcpSocket::readyRead, this, drain);
+            connect(data, &QTcpSocket::disconnected, this, [this, data, file, relative, failed, drain, lease]() {
+                drain();
+                if (!file->flush()) *failed = true;
                 const qint64 bytes = file->size();
                 file->close();
                 data->deleteLater();
-                reply(226, QStringLiteral("Transfer complete"));
-                emit owner_->fileStored(relative, bytes);
+                reply(*failed ? 451 : 226, *failed ? QStringLiteral("File write failed") : QStringLiteral("Transfer complete"));
+                if (!*failed) emit owner_->fileStored(relative, bytes);
             });
         });
         reply(150, QStringLiteral("Opening data connection"));
@@ -307,7 +319,7 @@ private:
         control_->flush();
     }
 
-    EmbeddedFtpReceiveServer* owner_ = nullptr;
+    EmbeddedFtpReceiveWorker* owner_ = nullptr;
     QTcpSocket* control_ = nullptr;
     QTcpServer* passiveServer_ = nullptr;
     QString cwd_ = QStringLiteral("/");
@@ -316,17 +328,17 @@ private:
     bool authenticated_ = false;
 };
 
-EmbeddedFtpReceiveServer::EmbeddedFtpReceiveServer(QObject* parent)
+EmbeddedFtpReceiveWorker::EmbeddedFtpReceiveWorker(QObject* parent)
     : QObject(parent)
 {
 }
 
-EmbeddedFtpReceiveServer::~EmbeddedFtpReceiveServer()
+EmbeddedFtpReceiveWorker::~EmbeddedFtpReceiveWorker()
 {
     stop();
 }
 
-bool EmbeddedFtpReceiveServer::start(const EmbeddedFtpReceiveServerConfig& config)
+bool EmbeddedFtpReceiveWorker::start(const EmbeddedFtpReceiveServerConfig& config)
 {
     stop();
     lastError_.clear();
@@ -359,41 +371,41 @@ bool EmbeddedFtpReceiveServer::start(const EmbeddedFtpReceiveServerConfig& confi
     return true;
 }
 
-void EmbeddedFtpReceiveServer::stop()
+void EmbeddedFtpReceiveWorker::stop()
 {
     const QList<Session*> sessions = sessions_;
     for (Session* session : sessions) {
-        if (session) session->deleteLater();
+        delete session;
     }
     sessions_.clear();
     if (controlServer_) {
         controlServer_->close();
-        controlServer_->deleteLater();
+        delete controlServer_;
         controlServer_ = nullptr;
     }
 }
 
-bool EmbeddedFtpReceiveServer::isListening() const
+bool EmbeddedFtpReceiveWorker::isListening() const
 {
     return controlServer_ && controlServer_->isListening();
 }
 
-quint16 EmbeddedFtpReceiveServer::controlPort() const
+quint16 EmbeddedFtpReceiveWorker::controlPort() const
 {
     return controlServer_ ? controlServer_->serverPort() : 0;
 }
 
-QString EmbeddedFtpReceiveServer::lastError() const
+QString EmbeddedFtpReceiveWorker::lastError() const
 {
     return lastError_;
 }
 
-EmbeddedFtpReceiveServerConfig EmbeddedFtpReceiveServer::config() const
+EmbeddedFtpReceiveServerConfig EmbeddedFtpReceiveWorker::config() const
 {
     return config_;
 }
 
-QString EmbeddedFtpReceiveServer::resolvePath(
+QString EmbeddedFtpReceiveWorker::resolvePath(
     const QString& cwd,
     const QString& ftpPath,
     bool* ok,
@@ -411,9 +423,9 @@ QString EmbeddedFtpReceiveServer::resolvePath(
     return target;
 }
 
-QTcpServer* EmbeddedFtpReceiveServer::createPassiveServer(QString* errorMessage) const
+QTcpServer* EmbeddedFtpReceiveWorker::createPassiveServer(QString* errorMessage) const
 {
-    auto* server = new QTcpServer(const_cast<EmbeddedFtpReceiveServer*>(this));
+    auto* server = new QTcpServer(const_cast<EmbeddedFtpReceiveWorker*>(this));
     const QHostAddress address = config_.listenAddress;
     if (config_.passivePortStart == 0 && config_.passivePortEnd == 0) {
         if (server->listen(address, 0)) return server;
@@ -427,14 +439,14 @@ QTcpServer* EmbeddedFtpReceiveServer::createPassiveServer(QString* errorMessage)
     return nullptr;
 }
 
-QHostAddress EmbeddedFtpReceiveServer::passiveReplyAddress() const
+QHostAddress EmbeddedFtpReceiveWorker::passiveReplyAddress() const
 {
     if (!config_.advertisedAddress.isNull()) return config_.advertisedAddress;
     if (controlServer_) return controlServer_->serverAddress();
     return config_.listenAddress;
 }
 
-void EmbeddedFtpReceiveServer::removeSession(Session* session)
+void EmbeddedFtpReceiveWorker::removeSession(Session* session)
 {
     sessions_.removeAll(session);
 }
@@ -442,3 +454,65 @@ void EmbeddedFtpReceiveServer::removeSession(Session* session)
 } // namespace rv1126b
 
 #include "EmbeddedFtpReceiveServer.moc"
+
+namespace rv1126b {
+EmbeddedFtpReceiveServer::EmbeddedFtpReceiveServer(QObject* parent) : QObject(parent)
+{
+    worker_ = new EmbeddedFtpReceiveWorker;
+    worker_->moveToThread(&ioThread_);
+    ioThread_.setObjectName(QStringLiteral("ftp-receive-io"));
+    connect(&ioThread_, &QThread::finished, worker_, &QObject::deleteLater);
+    connect(worker_, &EmbeddedFtpReceiveWorker::fileStored, this, &EmbeddedFtpReceiveServer::fileStored);
+    ioThread_.start();
+}
+EmbeddedFtpReceiveServer::~EmbeddedFtpReceiveServer()
+{
+    stop();
+    ioThread_.quit();
+    ioThread_.wait();
+}
+// Compatibility entry point for non-interactive callers. The UI uses startAsync.
+bool EmbeddedFtpReceiveServer::start(const EmbeddedFtpReceiveServerConfig& config)
+{
+    ++generation_;
+    starting_ = false;
+    config_ = config;
+    bool ok = false;
+    QMetaObject::invokeMethod(worker_, [this, config, &ok] {
+        ok = worker_->start(config);
+        port_ = worker_->controlPort();
+        lastError_ = worker_->lastError();
+    }, Qt::BlockingQueuedConnection);
+    return ok;
+}
+void EmbeddedFtpReceiveServer::startAsync(const EmbeddedFtpReceiveServerConfig& config)
+{
+    const auto generation = ++generation_;
+    config_ = config;
+    port_ = 0;
+    starting_ = true;
+    QMetaObject::invokeMethod(worker_, [this, config, generation] {
+        const bool ok = worker_->start(config);
+        const auto port = worker_->controlPort();
+        const auto error = worker_->lastError();
+        QMetaObject::invokeMethod(this, [this, generation, ok, port, error] {
+            if (generation != generation_) return;
+            port_ = port;
+            lastError_ = error;
+            starting_ = false;
+            emit started(ok);
+        }, Qt::QueuedConnection);
+    }, Qt::QueuedConnection);
+}
+void EmbeddedFtpReceiveServer::stop()
+{
+    ++generation_;
+    starting_ = false;
+    port_ = 0;
+    QMetaObject::invokeMethod(worker_, [worker = worker_] { worker->stop(); }, Qt::QueuedConnection);
+}
+bool EmbeddedFtpReceiveServer::isListening() const { return port_ != 0; }
+quint16 EmbeddedFtpReceiveServer::controlPort() const { return port_; }
+QString EmbeddedFtpReceiveServer::lastError() const { return lastError_; }
+EmbeddedFtpReceiveServerConfig EmbeddedFtpReceiveServer::config() const { return config_; }
+} // namespace rv1126b

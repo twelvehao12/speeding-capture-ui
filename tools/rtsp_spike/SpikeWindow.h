@@ -120,6 +120,8 @@ private:
     QElapsedTimer runElapsed_;
     QElapsedTimer healthElapsed_;
     QElapsedTimer metricElapsed_;
+    QElapsedTimer frameIntervalTimer_;
+    QList<qint64> frameIntervals_;
     QElapsedTimer networkOutageElapsed_;
     QElapsedTimer networkRecoveryElapsed_;
     bool networkRecoveryPending_ = false;

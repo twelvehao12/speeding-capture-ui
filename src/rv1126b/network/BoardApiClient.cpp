@@ -1,4 +1,5 @@
 #include "BoardApiClient.h"
+#include "FileDownloadExecutor.h"
 
 #include <QDir>
 #include <QFile>
@@ -69,8 +70,16 @@ DeviceProfile BoardApiClient::profile() const
 
 void BoardApiClient::setProfile(DeviceProfile profile)
 {
-    cancelAll();
+    if (profile.endpoint.apiBaseUrl != profile_.endpoint.apiBaseUrl
+        || profile.credentialRef != profile_.credentialRef || profile.deviceId != profile_.deviceId)
+        cancelAll();
     profile_ = std::move(profile);
+}
+
+BoardApiClient::~BoardApiClient()
+{
+    cancelAll();
+    fileDownloads_.reset();
 }
 
 RequestId BoardApiClient::getHealth(QObject* context, ApiCompletion<HealthDto> completion)
@@ -537,16 +546,7 @@ RequestId BoardApiClient::startJsonRequest(
     });
     connect(reply, &QNetworkReply::metaDataChanged, this, [this, requestId] { stopConnectTimer(requestId); });
     connect(reply, &QNetworkReply::finished, this, [this, requestId] { completeJsonRequest(requestId); });
-    if (context) {
-        connect(context, &QObject::destroyed, this, [this, requestId] {
-            const auto it = pendingRequests_.find(requestId);
-            if (it == pendingRequests_.end()) return;
-            PendingRequest pending = std::move(it.value());
-            pendingRequests_.erase(it);
-            if (pending.connectTimer) pending.connectTimer->stop();
-            if (pending.reply) pending.reply->abort();
-        });
-    }
+    watchContext(requestId, context);
     timer->start(firstResponseTimeoutMs);
     return requestId;
 }
@@ -595,43 +595,41 @@ RequestId BoardApiClient::startFileRequest(
         return requestId;
     }
 
-    QNetworkReply* reply = networkAccessManager_.get(request);
+    if (!fileDownloads_) fileDownloads_ = std::make_unique<FileDownloadExecutor>();
     PendingRequest pending;
-    pending.reply = reply;
-    const auto completionHolder = std::make_shared<ApiCompletion<EvidenceDownloadResult>>(std::move(completion));
-    pending.fail = [context, completionHolder](const ApiError& error) mutable {
-        queueCompletion(context, std::move(*completionHolder), ApiResult<EvidenceDownloadResult>::failure(error));
+    pending.fileDownload = true;
+    const auto holder = std::make_shared<ApiCompletion<EvidenceDownloadResult>>(std::move(completion));
+    pending.fail = [context, holder](const ApiError& error) mutable {
+        queueCompletion(context, std::move(*holder), ApiResult<EvidenceDownloadResult>::failure(error));
     };
-    pending.succeedEvidence = [context, completionHolder](const EvidenceDownloadResult& result) mutable {
-        queueCompletion(context, std::move(*completionHolder), ApiResult<EvidenceDownloadResult>::success(result));
+    pending.succeedEvidence = [context, holder](const EvidenceDownloadResult& result) mutable {
+        auto file = std::make_shared<FileDownloadExecutor::PendingFile>();
+        file->path = result.partFilePath;
+        if (!context) return;
+        QMetaObject::invokeMethod(context, [file, holder, result]() mutable {
+            file->delivered = true;
+            if (*holder) (*holder)(ApiResult<EvidenceDownloadResult>::success(result));
+        }, Qt::QueuedConnection);
     };
-    auto* timer = new QTimer(reply);
-    timer->setSingleShot(true);
-    pending.connectTimer = timer;
     pendingRequests_.insert(requestId, std::move(pending));
-
-    connect(timer, &QTimer::timeout, this, [this, requestId] {
-        failPending(requestId, localError(
-            QStringLiteral("network_connect_timeout"), QStringLiteral("Board connection timed out."), ApiErrorCategory::Network, true), true);
-    });
-    connect(reply, &QNetworkReply::metaDataChanged, this, [this, requestId] { stopConnectTimer(requestId); });
-    connect(reply, &QNetworkReply::finished, this, [this, requestId, partFilePath, requiredContentTypePrefix] {
-        completeEvidenceRequest(requestId, partFilePath, requiredContentTypePrefix);
-    });
-    if (context) {
-        connect(context, &QObject::destroyed, this, [this, requestId] {
+    watchContext(requestId, context);
+    fileDownloads_->start(requestId, request, partFilePath, requiredContentTypePrefix, JsonConnectTimeoutMs,
+        [this, requestId](int status, QByteArray payload, ApiResult<EvidenceDownloadResult> result) {
             const auto it = pendingRequests_.find(requestId);
-            if (it == pendingRequests_.end()) return;
+            if (it == pendingRequests_.end()) {
+                if (result) QFile::remove(result.value().partFilePath);
+                return;
+            }
             PendingRequest pending = std::move(it.value());
             pendingRequests_.erase(it);
-            if (pending.connectTimer) pending.connectTimer->stop();
-            if (pending.reply) pending.reply->abort();
+            disconnect(pending.contextDestroyed);
+            setProperty("pendingRequestCount", pendingRequests_.size());
+            if (status > 0 && !isSuccessfulStatus(status)) pending.fail(codec_->parseError(status, payload));
+            else if (!result) pending.fail(result.error());
+            else pending.succeedEvidence(result.value());
         });
-    }
-    timer->start(JsonConnectTimeoutMs);
     return requestId;
 }
-
 QUrl BoardApiClient::endpointUrl(const QString& relativePath, ApiError* error) const
 {
     const QUrl base = profile_.endpoint.apiBaseUrl;
@@ -712,6 +710,8 @@ void BoardApiClient::completeJsonRequest(const RequestId& requestId)
     if (it == pendingRequests_.end()) return;
     PendingRequest pending = std::move(it.value());
     pendingRequests_.erase(it);
+    disconnect(pending.contextDestroyed);
+    setProperty("pendingRequestCount", pendingRequests_.size());
     if (pending.connectTimer) pending.connectTimer->stop();
     if (!pending.reply) return;
 
@@ -732,73 +732,26 @@ void BoardApiClient::completeJsonRequest(const RequestId& requestId)
     reply->deleteLater();
 }
 
-void BoardApiClient::completeEvidenceRequest(
-    const RequestId& requestId,
-    const QString& partFilePath,
-    const QString& requiredContentTypePrefix)
+
+void BoardApiClient::watchContext(const RequestId& requestId, QObject* context)
 {
-    const auto it = pendingRequests_.find(requestId);
-    if (it == pendingRequests_.end()) return;
-    PendingRequest pending = std::move(it.value());
-    pendingRequests_.erase(it);
-    if (pending.connectTimer) pending.connectTimer->stop();
-    if (!pending.reply) return;
-
-    QNetworkReply* reply = pending.reply;
-    const QByteArray payload = reply->readAll();
-    const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-    if (status <= 0 && reply->error() != QNetworkReply::NoError) {
-        pending.fail(networkError(reply));
-        reply->deleteLater();
-        return;
-    }
-    if (!isSuccessfulStatus(status)) {
-        pending.fail(codec_->parseError(status, payload));
-        reply->deleteLater();
-        return;
-    }
-    if (reply->error() != QNetworkReply::NoError) {
-        pending.fail(networkError(reply));
-        reply->deleteLater();
-        return;
-    }
-    if (!requiredContentTypePrefix.isEmpty()
-        && !contentType(reply).startsWith(requiredContentTypePrefix)) {
-        pending.fail(localError(QStringLiteral("invalid_content_type"), QStringLiteral("Unexpected download content type."), ApiErrorCategory::Protocol));
-        reply->deleteLater();
-        return;
-    }
-    const QVariant lengthHeader = reply->header(QNetworkRequest::ContentLengthHeader);
-    bool lengthOk = false;
-    const qint64 expectedLength = lengthHeader.toLongLong(&lengthOk);
-    if (!lengthOk || expectedLength < 0 || expectedLength != payload.size()) {
-        pending.fail(localError(QStringLiteral("invalid_content_length"), QStringLiteral("Evidence length does not match Content-Length."), ApiErrorCategory::Protocol));
-        reply->deleteLater();
-        return;
-    }
-    const QFileInfo fileInfo(partFilePath);
-    if (!QDir().mkpath(fileInfo.absolutePath())) {
-        pending.fail(localError(QStringLiteral("evidence_write_failed"), QStringLiteral("Could not create evidence cache directory."), ApiErrorCategory::Storage));
-        reply->deleteLater();
-        return;
-    }
-    QFile file(partFilePath);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate) || file.write(payload) != payload.size()) {
-        file.close();
-        pending.fail(localError(QStringLiteral("evidence_write_failed"), QStringLiteral("Could not write evidence part file."), ApiErrorCategory::Storage));
-        reply->deleteLater();
-        return;
-    }
-    file.close();
-    EvidenceDownloadResult result;
-    result.partFilePath = partFilePath;
-    result.contentType = contentType(reply);
-    result.expectedContentLength = expectedLength;
-    result.receivedBytes = payload.size();
-    pending.succeedEvidence(result);
-    reply->deleteLater();
+    setProperty("pendingRequestCount", pendingRequests_.size());
+    if (!context) return;
+    pendingRequests_[requestId].contextDestroyed = connect(context, &QObject::destroyed, this, [this, requestId] {
+        const auto it = pendingRequests_.find(requestId);
+        if (it == pendingRequests_.end()) return;
+        PendingRequest pending = std::move(it.value());
+        pendingRequests_.erase(it);
+        disconnect(pending.contextDestroyed);
+        setProperty("pendingRequestCount", pendingRequests_.size());
+        if (pending.connectTimer) pending.connectTimer->stop();
+        if (pending.fileDownload && fileDownloads_) fileDownloads_->cancel(requestId);
+        if (pending.reply) {
+            pending.reply->abort();
+            pending.reply->deleteLater();
+        }
+    });
 }
-
 void BoardApiClient::stopConnectTimer(const RequestId& requestId)
 {
     const auto it = pendingRequests_.find(requestId);
@@ -813,7 +766,10 @@ void BoardApiClient::failPending(const RequestId& requestId, const ApiError& err
     if (it == pendingRequests_.end()) return;
     PendingRequest pending = std::move(it.value());
     pendingRequests_.erase(it);
+    disconnect(pending.contextDestroyed);
+    setProperty("pendingRequestCount", pendingRequests_.size());
     if (pending.connectTimer) pending.connectTimer->stop();
+    if (pending.fileDownload && fileDownloads_) fileDownloads_->cancel(requestId);
     if (pending.reply) {
         if (abortReply) pending.reply->abort();
         pending.reply->deleteLater();

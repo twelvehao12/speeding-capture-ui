@@ -272,7 +272,7 @@ void DeviceOperationsUiTest::startsEmbeddedReceiverAndSavesUniqueTargetId()
 
     QTest::mouseClick(dialog.findChild<QPushButton*>(QStringLiteral("localFtpSaveTargetButton")), Qt::LeftButton);
 
-    QVERIFY(server.isListening());
+    QTRY_VERIFY(server.isListening());
     QCOMPARE(ftp.saveCount, 1);
     const auto local = std::find_if(ftp.lastUpdate.targets.cbegin(), ftp.lastUpdate.targets.cend(), [](const FtpTargetUpdate& target) {
         return target.id == QStringLiteral("pc_test_bay");

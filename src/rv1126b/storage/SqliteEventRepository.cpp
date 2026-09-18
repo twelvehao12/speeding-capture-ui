@@ -1,4 +1,4 @@
-#include "SqliteEventRepository.h"
+#include "SqliteEventStore.h"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -104,19 +104,19 @@ QString sqlErrorText(const QSqlDatabase& database)
 
 } // namespace
 
-SqliteEventRepository::SqliteEventRepository(QObject* parent)
-    : SqliteEventRepository(defaultDatabasePath(), parent)
+SqliteEventStore::SqliteEventStore(QObject* parent)
+    : SqliteEventStore(defaultDatabasePath(), parent)
 {
 }
 
-SqliteEventRepository::SqliteEventRepository(const QString& databasePath, QObject* parent)
+SqliteEventStore::SqliteEventStore(const QString& databasePath, QObject* parent)
     : IEventRepository(parent)
     , databasePath_(databasePath)
     , connectionName_(QStringLiteral("rv1126b-events-%1").arg(reinterpret_cast<quintptr>(this)))
 {
 }
 
-SqliteEventRepository::~SqliteEventRepository()
+SqliteEventStore::~SqliteEventStore()
 {
     if (database_.isValid()) {
         database_.close();
@@ -125,7 +125,7 @@ SqliteEventRepository::~SqliteEventRepository()
     QSqlDatabase::removeDatabase(connectionName_);
 }
 
-RequestId SqliteEventRepository::initialize(QObject* context, ApiCompletion<void> completion)
+RequestId SqliteEventStore::initialize(QObject* context, ApiCompletion<void> completion)
 {
     QString errorMessage;
     if (!openDatabase(&errorMessage) || !ensureSchema(&errorMessage)) {
@@ -134,7 +134,7 @@ RequestId SqliteEventRepository::initialize(QObject* context, ApiCompletion<void
     return finish<void>(context, std::move(completion), ApiResult<void>::success());
 }
 
-RequestId SqliteEventRepository::upsertDevice(
+RequestId SqliteEventStore::upsertDevice(
     const DeviceProfile& profile,
     QObject* context,
     ApiCompletion<void> completion)
@@ -150,7 +150,7 @@ RequestId SqliteEventRepository::upsertDevice(
     return finish<void>(context, std::move(completion), ApiResult<void>::success());
 }
 
-RequestId SqliteEventRepository::loadDeviceProfiles(
+RequestId SqliteEventStore::loadDeviceProfiles(
     QObject* context,
     ApiCompletion<QVector<DeviceProfile>> completion)
 {
@@ -184,7 +184,7 @@ RequestId SqliteEventRepository::loadDeviceProfiles(
         ApiResult<QVector<DeviceProfile>>::success(std::move(profiles)));
 }
 
-RequestId SqliteEventRepository::deleteDeviceProfile(
+RequestId SqliteEventStore::deleteDeviceProfile(
     const QString& deviceId,
     QObject* context,
     ApiCompletion<void> completion)
@@ -205,7 +205,7 @@ RequestId SqliteEventRepository::deleteDeviceProfile(
     return finish<void>(context, std::move(completion), ApiResult<void>::success());
 }
 
-RequestId SqliteEventRepository::upsertEvents(
+RequestId SqliteEventStore::upsertEvents(
     const QVector<VehicleEvent>& events,
     QObject* context,
     ApiCompletion<void> completion)
@@ -231,7 +231,7 @@ RequestId SqliteEventRepository::upsertEvents(
     return finish<void>(context, std::move(completion), ApiResult<void>::success());
 }
 
-RequestId SqliteEventRepository::saveDetail(
+RequestId SqliteEventStore::saveDetail(
     const EventDetailSnapshot& detail,
     QObject* context,
     ApiCompletion<void> completion)
@@ -272,7 +272,7 @@ RequestId SqliteEventRepository::saveDetail(
     return finish<void>(context, std::move(completion), ApiResult<void>::success());
 }
 
-RequestId SqliteEventRepository::queryEvents(
+RequestId SqliteEventStore::queryEvents(
     const EventQuery& eventQuery,
     QObject* context,
     ApiCompletion<QVector<VehicleEvent>> completion)
@@ -348,7 +348,7 @@ RequestId SqliteEventRepository::queryEvents(
         ApiResult<QVector<VehicleEvent>>::success(std::move(events)));
 }
 
-RequestId SqliteEventRepository::loadEvent(
+RequestId SqliteEventStore::loadEvent(
     const EventIdentity& identity,
     QObject* context,
     ApiCompletion<std::optional<VehicleEvent>> completion)
@@ -388,7 +388,7 @@ RequestId SqliteEventRepository::loadEvent(
         ApiResult<std::optional<VehicleEvent>>::success(std::move(event)));
 }
 
-RequestId SqliteEventRepository::deleteEvent(
+RequestId SqliteEventStore::deleteEvent(
     const EventIdentity& identity,
     QObject* context,
     ApiCompletion<void> completion)
@@ -424,7 +424,7 @@ RequestId SqliteEventRepository::deleteEvent(
     return finish<void>(context, std::move(completion), ApiResult<void>::success());
 }
 
-RequestId SqliteEventRepository::loadNonTerminalEvents(
+RequestId SqliteEventStore::loadNonTerminalEvents(
     const QString& deviceId,
     QObject* context,
     ApiCompletion<QVector<VehicleEvent>> completion)
@@ -471,7 +471,7 @@ RequestId SqliteEventRepository::loadNonTerminalEvents(
         ApiResult<QVector<VehicleEvent>>::success(std::move(events)));
 }
 
-RequestId SqliteEventRepository::saveEvidenceState(
+RequestId SqliteEventStore::saveEvidenceState(
     const EvidenceCacheEntry& evidence,
     QObject* context,
     ApiCompletion<void> completion)
@@ -483,7 +483,7 @@ RequestId SqliteEventRepository::saveEvidenceState(
     return finish<void>(context, std::move(completion), ApiResult<void>::success());
 }
 
-RequestId SqliteEventRepository::loadEvidenceState(
+RequestId SqliteEventStore::loadEvidenceState(
     const EventIdentity& identity,
     const QString& role,
     QObject* context,
@@ -524,7 +524,7 @@ RequestId SqliteEventRepository::loadEvidenceState(
         ApiResult<std::optional<EvidenceCacheEntry>>::success(std::move(entry)));
 }
 
-RequestId SqliteEventRepository::loadSyncAnchor(
+RequestId SqliteEventStore::loadSyncAnchor(
     const QString& deviceId,
     QObject* context,
     ApiCompletion<std::optional<SyncAnchor>> completion)
@@ -567,7 +567,7 @@ RequestId SqliteEventRepository::loadSyncAnchor(
         ApiResult<std::optional<SyncAnchor>>::success(std::move(anchor)));
 }
 
-RequestId SqliteEventRepository::saveSyncAnchor(
+RequestId SqliteEventStore::saveSyncAnchor(
     const SyncAnchor& anchor,
     QObject* context,
     ApiCompletion<void> completion)
@@ -599,7 +599,7 @@ RequestId SqliteEventRepository::saveSyncAnchor(
     return finish<void>(context, std::move(completion), ApiResult<void>::success());
 }
 
-RequestId SqliteEventRepository::saveFtpTaskSnapshot(
+RequestId SqliteEventStore::saveFtpTaskSnapshot(
     const StoredFtpTask& task,
     QObject* context,
     ApiCompletion<void> completion)
@@ -615,7 +615,7 @@ RequestId SqliteEventRepository::saveFtpTaskSnapshot(
     return finish<void>(context, std::move(completion), ApiResult<void>::success());
 }
 
-RequestId SqliteEventRepository::loadFtpTaskSnapshots(
+RequestId SqliteEventStore::loadFtpTaskSnapshots(
     const FtpTaskQuery& taskQuery,
     QObject* context,
     ApiCompletion<QVector<StoredFtpTask>> completion)
@@ -688,16 +688,16 @@ RequestId SqliteEventRepository::loadFtpTaskSnapshots(
         ApiResult<QVector<StoredFtpTask>>::success(std::move(tasks)));
 }
 
-void SqliteEventRepository::cancel(const RequestId& requestId)
+void SqliteEventStore::cancel(const RequestId& requestId)
 {
     Q_UNUSED(requestId)
 }
 
-void SqliteEventRepository::cancelAll()
+void SqliteEventStore::cancelAll()
 {
 }
 
-bool SqliteEventRepository::openDatabase(QString* errorMessage)
+bool SqliteEventStore::openDatabase(QString* errorMessage)
 {
     if (database_.isOpen()) {
         return true;
@@ -725,7 +725,7 @@ bool SqliteEventRepository::openDatabase(QString* errorMessage)
     return true;
 }
 
-bool SqliteEventRepository::ensureSchema(QString* errorMessage)
+bool SqliteEventStore::ensureSchema(QString* errorMessage)
 {
     const QStringList statements {
         QStringLiteral(
@@ -837,6 +837,8 @@ bool SqliteEventRepository::ensureSchema(QString* errorMessage)
             "PRIMARY KEY (device_id, task_id, target_id)"
             ")"),
         QStringLiteral("CREATE INDEX IF NOT EXISTS idx_rv_events_device_time ON rv_events(device_id, event_epoch_ms DESC)"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_rv_events_device_order ON rv_events(device_id, event_epoch_ms DESC, event_id DESC, track_id DESC)"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_rv_events_order ON rv_events(event_epoch_ms DESC, event_id DESC, track_id DESC)"),
         QStringLiteral("CREATE INDEX IF NOT EXISTS idx_rv_events_plate ON rv_events(plate_text)"),
         QStringLiteral("CREATE INDEX IF NOT EXISTS idx_rv_events_ocr ON rv_events(device_id, ocr_status_value)"),
         QStringLiteral("CREATE INDEX IF NOT EXISTS idx_rv_evidence_status ON rv_evidence_cache(status_value, updated_epoch_ms)"),
@@ -874,7 +876,7 @@ bool SqliteEventRepository::ensureSchema(QString* errorMessage)
     return true;
 }
 
-bool SqliteEventRepository::migrateEventSchema(QString* errorMessage)
+bool SqliteEventStore::migrateEventSchema(QString* errorMessage)
 {
     QSqlQuery infoQuery(database_);
     if (!infoQuery.exec(QStringLiteral("PRAGMA table_info(rv_events)"))) {
@@ -902,7 +904,7 @@ bool SqliteEventRepository::migrateEventSchema(QString* errorMessage)
     return true;
 }
 
-bool SqliteEventRepository::migrateEvidenceCacheSchema(QString* errorMessage)
+bool SqliteEventStore::migrateEvidenceCacheSchema(QString* errorMessage)
 {
     QSqlQuery infoQuery(database_);
     if (!infoQuery.exec(QStringLiteral("PRAGMA table_info(rv_evidence_cache)"))) {
@@ -961,7 +963,7 @@ bool SqliteEventRepository::migrateEvidenceCacheSchema(QString* errorMessage)
     return true;
 }
 
-bool SqliteEventRepository::execSql(const QString& sql, QString* errorMessage)
+bool SqliteEventStore::execSql(const QString& sql, QString* errorMessage)
 {
     QSqlQuery query(database_);
     if (!query.exec(sql)) {
@@ -973,7 +975,7 @@ bool SqliteEventRepository::execSql(const QString& sql, QString* errorMessage)
     return true;
 }
 
-bool SqliteEventRepository::beginTransaction(QString* errorMessage)
+bool SqliteEventStore::beginTransaction(QString* errorMessage)
 {
     if (!database_.transaction()) {
         if (errorMessage) {
@@ -984,7 +986,7 @@ bool SqliteEventRepository::beginTransaction(QString* errorMessage)
     return true;
 }
 
-bool SqliteEventRepository::commitTransaction(QString* errorMessage)
+bool SqliteEventStore::commitTransaction(QString* errorMessage)
 {
     if (!database_.commit()) {
         if (errorMessage) {
@@ -995,14 +997,14 @@ bool SqliteEventRepository::commitTransaction(QString* errorMessage)
     return true;
 }
 
-void SqliteEventRepository::rollbackTransaction()
+void SqliteEventStore::rollbackTransaction()
 {
     if (database_.isOpen()) {
         database_.rollback();
     }
 }
 
-ApiError SqliteEventRepository::storageError(const QString& message) const
+ApiError SqliteEventStore::storageError(const QString& message) const
 {
     ApiError error;
     error.code = QStringLiteral("storage_error");
@@ -1012,7 +1014,7 @@ ApiError SqliteEventRepository::storageError(const QString& message) const
     return error;
 }
 
-bool SqliteEventRepository::upsertDeviceInternal(const DeviceProfile& profile, QString* errorMessage)
+bool SqliteEventStore::upsertDeviceInternal(const DeviceProfile& profile, QString* errorMessage)
 {
     QSqlQuery query(database_);
     query.prepare(QStringLiteral(
@@ -1047,7 +1049,7 @@ bool SqliteEventRepository::upsertDeviceInternal(const DeviceProfile& profile, Q
     return true;
 }
 
-bool SqliteEventRepository::upsertEventInternal(const VehicleEvent& event, QString* errorMessage)
+bool SqliteEventStore::upsertEventInternal(const VehicleEvent& event, QString* errorMessage)
 {
     QSqlQuery query(database_);
     query.prepare(QStringLiteral(
@@ -1107,7 +1109,7 @@ bool SqliteEventRepository::upsertEventInternal(const VehicleEvent& event, QStri
     return true;
 }
 
-bool SqliteEventRepository::saveEvidenceStateInternal(const EvidenceCacheEntry& evidence, QString* errorMessage)
+bool SqliteEventStore::saveEvidenceStateInternal(const EvidenceCacheEntry& evidence, QString* errorMessage)
 {
     QSqlQuery query(database_);
     query.prepare(QStringLiteral(
@@ -1139,7 +1141,7 @@ bool SqliteEventRepository::saveEvidenceStateInternal(const EvidenceCacheEntry& 
     return true;
 }
 
-bool SqliteEventRepository::saveFtpTaskSnapshotInternal(const StoredFtpTask& task, QString* errorMessage)
+bool SqliteEventStore::saveFtpTaskSnapshotInternal(const StoredFtpTask& task, QString* errorMessage)
 {
     QSqlQuery taskQuery(database_);
     taskQuery.prepare(QStringLiteral(
@@ -1209,7 +1211,7 @@ bool SqliteEventRepository::saveFtpTaskSnapshotInternal(const StoredFtpTask& tas
     return true;
 }
 
-bool SqliteEventRepository::loadFtpTaskTargets(StoredFtpTask* task, QString* errorMessage) const
+bool SqliteEventStore::loadFtpTaskTargets(StoredFtpTask* task, QString* errorMessage) const
 {
     QSqlQuery query(database_);
     query.prepare(QStringLiteral(
@@ -1232,7 +1234,7 @@ bool SqliteEventRepository::loadFtpTaskTargets(StoredFtpTask* task, QString* err
     return true;
 }
 
-DeviceProfile SqliteEventRepository::deviceProfileFromQuery(const QSqlQuery& query) const
+DeviceProfile SqliteEventStore::deviceProfileFromQuery(const QSqlQuery& query) const
 {
     DeviceProfile profile;
     profile.deviceId = query.value(0).toString();
@@ -1248,7 +1250,7 @@ DeviceProfile SqliteEventRepository::deviceProfileFromQuery(const QSqlQuery& que
     return profile;
 }
 
-VehicleEvent SqliteEventRepository::eventFromQuery(const QSqlQuery& query) const
+VehicleEvent SqliteEventStore::eventFromQuery(const QSqlQuery& query) const
 {
     VehicleEvent event;
     event.identity.deviceId = query.value(0).toString();
@@ -1277,7 +1279,7 @@ VehicleEvent SqliteEventRepository::eventFromQuery(const QSqlQuery& query) const
     return event;
 }
 
-EvidenceCacheEntry SqliteEventRepository::evidenceFromQuery(const QSqlQuery& query) const
+EvidenceCacheEntry SqliteEventStore::evidenceFromQuery(const QSqlQuery& query) const
 {
     EvidenceCacheEntry evidence;
     evidence.identity.deviceId = query.value(0).toString();
@@ -1293,7 +1295,7 @@ EvidenceCacheEntry SqliteEventRepository::evidenceFromQuery(const QSqlQuery& que
     return evidence;
 }
 
-StoredFtpTask SqliteEventRepository::ftpTaskFromQuery(const QSqlQuery& query) const
+StoredFtpTask SqliteEventStore::ftpTaskFromQuery(const QSqlQuery& query) const
 {
     StoredFtpTask task;
     task.deviceId = query.value(0).toString();
@@ -1306,7 +1308,7 @@ StoredFtpTask SqliteEventRepository::ftpTaskFromQuery(const QSqlQuery& query) co
     return task;
 }
 
-StoredFtpTargetStatus SqliteEventRepository::ftpTargetFromQuery(const QSqlQuery& query) const
+StoredFtpTargetStatus SqliteEventStore::ftpTargetFromQuery(const QSqlQuery& query) const
 {
     StoredFtpTargetStatus target;
     target.targetId = query.value(0).toString();
@@ -1321,4 +1323,240 @@ StoredFtpTargetStatus SqliteEventRepository::ftpTargetFromQuery(const QSqlQuery&
     return target;
 }
 
+} // namespace rv1126b
+
+#include "SqliteEventRepository.h"
+
+namespace rv1126b {
+SqliteEventRepository::SqliteEventRepository(QObject* parent)
+    : SqliteEventRepository(defaultDatabasePath(), parent) {}
+
+SqliteEventRepository::SqliteEventRepository(const QString& databasePath, QObject* parent)
+    : IEventRepository(parent)
+{
+    store_ = new SqliteEventStore(databasePath);
+    worker_ = store_;
+    worker_->moveToThread(&workerThread_);
+    workerThread_.setObjectName(QStringLiteral("event-database"));
+    connect(&workerThread_, &QThread::finished, worker_, &QObject::deleteLater);
+    workerThread_.start();
+}
+
+SqliteEventRepository::~SqliteEventRepository()
+{
+    cancelAll();
+    workerThread_.quit();
+    workerThread_.wait();
+}
+
+void SqliteEventRepository::cancel(const RequestId& id)
+{
+    auto pending = pending_.take(id);
+    if (!pending) return;
+    pending->cancelled = true;
+    disconnect(pending->contextDestroyed);
+    setProperty("pendingRequestCount", pending_.size());
+}
+
+void SqliteEventRepository::cancelAll()
+{
+    const auto ids = pending_.keys();
+    for (const auto& id : ids) cancel(id);
+}
+RequestId SqliteEventRepository::initialize(QObject* context, ApiCompletion<void> completion)
+{
+    return submit<void>(context, std::move(completion), [store = store_](ApiCompletion<void> done) mutable {
+        store->initialize(store, std::move(done));
+    });
+}
+
+RequestId SqliteEventRepository::upsertDevice(const DeviceProfile& profile,
+        QObject* context,
+        ApiCompletion<void> completion)
+{
+    return submit<void>(context, std::move(completion), [store = store_, profile](ApiCompletion<void> done) mutable {
+        store->upsertDevice(profile, store, std::move(done));
+    });
+}
+
+RequestId SqliteEventRepository::loadDeviceProfiles(QObject* context,
+        ApiCompletion<QVector<DeviceProfile>> completion)
+{
+    return submit<QVector<DeviceProfile>>(context, std::move(completion), [store = store_](ApiCompletion<QVector<DeviceProfile>> done) mutable {
+        store->loadDeviceProfiles(store, std::move(done));
+    });
+}
+
+RequestId SqliteEventRepository::deleteDeviceProfile(const QString& deviceId,
+        QObject* context,
+        ApiCompletion<void> completion)
+{
+    return submit<void>(context, std::move(completion), [store = store_, deviceId](ApiCompletion<void> done) mutable {
+        store->deleteDeviceProfile(deviceId, store, std::move(done));
+    });
+}
+
+RequestId SqliteEventRepository::upsertEvents(const QVector<VehicleEvent>& events,
+        QObject* context,
+        ApiCompletion<void> completion)
+{
+    return submit<void>(context, std::move(completion), [store = store_, events](ApiCompletion<void> done) mutable {
+        store->upsertEvents(events, store, std::move(done));
+    });
+}
+
+RequestId SqliteEventRepository::saveDetail(const EventDetailSnapshot& detail,
+        QObject* context,
+        ApiCompletion<void> completion)
+{
+    return submit<void>(context, std::move(completion), [store = store_, detail](ApiCompletion<void> done) mutable {
+        store->saveDetail(detail, store, std::move(done));
+    });
+}
+
+RequestId SqliteEventRepository::queryEvents(const EventQuery& query,
+        QObject* context,
+        ApiCompletion<QVector<VehicleEvent>> completion)
+{
+    return submit<QVector<VehicleEvent>>(context, std::move(completion), [store = store_, query](ApiCompletion<QVector<VehicleEvent>> done) mutable {
+        store->queryEvents(query, store, std::move(done));
+    });
+}
+
+RequestId SqliteEventRepository::loadEvent(const EventIdentity& identity,
+        QObject* context,
+        ApiCompletion<std::optional<VehicleEvent>> completion)
+{
+    return submit<std::optional<VehicleEvent>>(context, std::move(completion), [store = store_, identity](ApiCompletion<std::optional<VehicleEvent>> done) mutable {
+        store->loadEvent(identity, store, std::move(done));
+    });
+}
+
+RequestId SqliteEventRepository::deleteEvent(const EventIdentity& identity,
+        QObject* context,
+        ApiCompletion<void> completion)
+{
+    return submit<void>(context, std::move(completion), [store = store_, identity](ApiCompletion<void> done) mutable {
+        store->deleteEvent(identity, store, std::move(done));
+    });
+}
+
+RequestId SqliteEventRepository::loadNonTerminalEvents(const QString& deviceId,
+        QObject* context,
+        ApiCompletion<QVector<VehicleEvent>> completion)
+{
+    return submit<QVector<VehicleEvent>>(context, std::move(completion), [store = store_, deviceId](ApiCompletion<QVector<VehicleEvent>> done) mutable {
+        store->loadNonTerminalEvents(deviceId, store, std::move(done));
+    });
+}
+
+RequestId SqliteEventRepository::saveEvidenceState(const EvidenceCacheEntry& evidence,
+        QObject* context,
+        ApiCompletion<void> completion)
+{
+    return submit<void>(context, std::move(completion), [store = store_, evidence](ApiCompletion<void> done) mutable {
+        store->saveEvidenceState(evidence, store, std::move(done));
+    });
+}
+
+RequestId SqliteEventRepository::loadEvidenceState(const EventIdentity& identity,
+        const QString& role,
+        QObject* context,
+        ApiCompletion<std::optional<EvidenceCacheEntry>> completion)
+{
+    return submit<std::optional<EvidenceCacheEntry>>(context, std::move(completion), [store = store_, identity, role](ApiCompletion<std::optional<EvidenceCacheEntry>> done) mutable {
+        store->loadEvidenceState(identity, role, store, std::move(done));
+    });
+}
+
+RequestId SqliteEventRepository::loadSyncAnchor(const QString& deviceId,
+        QObject* context,
+        ApiCompletion<std::optional<SyncAnchor>> completion)
+{
+    return submit<std::optional<SyncAnchor>>(context, std::move(completion), [store = store_, deviceId](ApiCompletion<std::optional<SyncAnchor>> done) mutable {
+        store->loadSyncAnchor(deviceId, store, std::move(done));
+    });
+}
+
+RequestId SqliteEventRepository::saveSyncAnchor(const SyncAnchor& anchor,
+        QObject* context,
+        ApiCompletion<void> completion)
+{
+    return submit<void>(context, std::move(completion), [store = store_, anchor](ApiCompletion<void> done) mutable {
+        store->saveSyncAnchor(anchor, store, std::move(done));
+    });
+}
+
+RequestId SqliteEventRepository::saveFtpTaskSnapshot(const StoredFtpTask& task,
+        QObject* context,
+        ApiCompletion<void> completion)
+{
+    return submit<void>(context, std::move(completion), [store = store_, task](ApiCompletion<void> done) mutable {
+        store->saveFtpTaskSnapshot(task, store, std::move(done));
+    });
+}
+
+RequestId SqliteEventRepository::loadFtpTaskSnapshots(const FtpTaskQuery& query,
+        QObject* context,
+        ApiCompletion<QVector<StoredFtpTask>> completion)
+{
+    return submit<QVector<StoredFtpTask>>(context, std::move(completion), [store = store_, query](ApiCompletion<QVector<StoredFtpTask>> done) mutable {
+        store->loadFtpTaskSnapshots(query, store, std::move(done));
+    });
+}
+
+} // namespace rv1126b
+
+namespace rv1126b {
+RequestId SqliteEventRepository::loadPendingEvidence(int limit, const QStringList& deviceIds,
+    const QVector<EventIdentity>& excluded, QObject* context, ApiCompletion<QVector<VehicleEvent>> completion)
+{
+    return submit<QVector<VehicleEvent>>(context, std::move(completion),
+        [store = store_, limit, deviceIds, excluded](ApiCompletion<QVector<VehicleEvent>> done) {
+            store->loadPendingEvidence(limit, deviceIds, excluded, store, std::move(done));
+        });
+}
+
+RequestId SqliteEventStore::loadPendingEvidence(int limit, const QStringList& deviceIds,
+    const QVector<EventIdentity>& excluded, QObject* context, ApiCompletion<QVector<VehicleEvent>> completion)
+{
+    if (deviceIds.isEmpty()) return finish<QVector<VehicleEvent>>(context, std::move(completion),
+        ApiResult<QVector<VehicleEvent>>::success({}));
+    QString error;
+    if (!openDatabase(&error)) return finish<QVector<VehicleEvent>>(context, std::move(completion),
+        ApiResult<QVector<VehicleEvent>>::failure(storageError(error)));
+    QString sql = QStringLiteral(
+        "SELECT e.device_id,e.event_id,e.track_id,e.event_epoch_ms,e.source_epoch_ms,e.offset_applied_ms,"
+        "e.time_quality_value,e.time_quality_raw,e.motion_direction,e.speed_kmh,e.speed_valid,e.speed_status,"
+        "e.ocr_status_value,e.ocr_status_raw,e.plate_text,e.plate_ascii,e.plate_color,e.evidence_status,"
+        "e.evidence_available,e.detail_relative_url,e.evidence_relative_url,e.capture_status,e.capture_error,"
+        "e.first_seen_epoch_ms,e.last_updated_epoch_ms FROM rv_events e JOIN rv_evidence_cache c "
+        "ON e.device_id=c.device_id AND e.event_id=c.event_id AND e.track_id=c.track_id "
+        "WHERE c.role='evidence' AND c.status_value IN (:queued,:downloading,:retry) "
+        "AND e.evidence_available=1 AND e.evidence_relative_url<>''");
+    QStringList devices;
+    for (int i = 0; i < deviceIds.size(); ++i) devices.append(QStringLiteral(":device%1").arg(i));
+    sql += QStringLiteral(" AND e.device_id IN (") + devices.join(',') + ')';
+    for (int i = 0; i < excluded.size(); ++i)
+        sql += QStringLiteral(" AND NOT(e.device_id=:d%1 AND e.event_id=:e%1 AND e.track_id=:t%1)").arg(i);
+    sql += QStringLiteral(" ORDER BY e.event_epoch_ms DESC,e.event_id DESC,e.track_id DESC LIMIT :limit");
+    QSqlQuery query(database_);
+    query.prepare(sql);
+    query.bindValue(":queued", int(EvidenceCacheStatus::Queued));
+    query.bindValue(":downloading", int(EvidenceCacheStatus::Downloading));
+    query.bindValue(":retry", int(EvidenceCacheStatus::RetryWait));
+    query.bindValue(":limit", qBound(1, limit, 256));
+    for (int i = 0; i < deviceIds.size(); ++i) query.bindValue(devices.at(i), deviceIds.at(i));
+    for (int i = 0; i < excluded.size(); ++i) {
+        query.bindValue(QStringLiteral(":d%1").arg(i), excluded.at(i).deviceId);
+        query.bindValue(QStringLiteral(":e%1").arg(i), excluded.at(i).eventId);
+        query.bindValue(QStringLiteral(":t%1").arg(i), excluded.at(i).trackId);
+    }
+    if (!query.exec()) return finish<QVector<VehicleEvent>>(context, std::move(completion),
+        ApiResult<QVector<VehicleEvent>>::failure(storageError(query.lastError().text())));
+    QVector<VehicleEvent> events;
+    while (query.next()) events.append(eventFromQuery(query));
+    return finish<QVector<VehicleEvent>>(context, std::move(completion),
+        ApiResult<QVector<VehicleEvent>>::success(std::move(events)));
+}
 } // namespace rv1126b

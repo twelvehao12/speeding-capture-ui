@@ -5,6 +5,8 @@
 #include "../rv1126b/application/VideoStreamsController.h"
 
 #include <QWidget>
+#include <QPointer>
+#include <QTimer>
 
 #include <optional>
 
@@ -40,6 +42,8 @@ protected:
 private:
     void updateVideoControls();
     void clearActualResolution();
+    void invalidateDetectionRequests();
+    void finishDetectionRead(quint64 generation);
     void loadDetectionConfig();
     void saveDetectionConfig();
     void saveLineRegionConfig(const QString& runtimeRevision, bool restartRequired);
@@ -75,7 +79,14 @@ private:
     LineRegionOverlayWidget* lineOverlay_ = nullptr;
     QWidget* videoOutput_ = nullptr;
     QWidget* videoHost_ = nullptr;
-    rv1126b::IBoardApiClient* boardApi_ = nullptr;
+    QPointer<rv1126b::IBoardApiClient> boardApi_;
+    QPointer<QObject> detectionContext_;
+    QMetaObject::Connection detectionApiDestroyed_;
+    QTimer detectionRefreshTimer_;
+    quint64 detectionGeneration_ = 0;
+    int detectionReadsPending_ = 0;
+    bool detectionReadFailed_ = false;
+    QSize actualFrameSize_;
     QString currentDeviceId_;
     std::optional<rv1126b::TriggerModeConfigDto> triggerModeConfig_;
     std::optional<rv1126b::LineRegionConfigDto> lineRegionConfig_;

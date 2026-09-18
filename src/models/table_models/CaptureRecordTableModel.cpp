@@ -3,6 +3,7 @@
 #include <QBrush>
 #include <QColor>
 #include <QDateTime>
+#include <algorithm>
 
 namespace {
 
@@ -208,6 +209,7 @@ void CaptureRecordTableModel::setRecords(const QVector<CaptureRecord>& records)
     realEventMode_ = false;
     records_ = records;
     events_.clear();
+    rowByIdentity_.clear();
     evidenceByIdentity_.clear();
     endResetModel();
 }
@@ -218,27 +220,61 @@ void CaptureRecordTableModel::setVehicleEvents(const QVector<rv1126b::VehicleEve
     realEventMode_ = true;
     records_.clear();
     events_ = events;
+    rebuildEventIndex();
     endResetModel();
 }
 
 void CaptureRecordTableModel::upsertVehicleEvent(const rv1126b::VehicleEvent& event, int maximumRows)
 {
+    upsertVehicleEvents({event}, maximumRows);
+}
+
+void CaptureRecordTableModel::upsertVehicleEvents(const QVector<rv1126b::VehicleEvent>& changes, int maximumRows)
+{
     if (!realEventMode_) setVehicleEvents({});
-    for (int row = 0; row < events_.size(); ++row) {
-        if (events_.at(row).identity == event.identity) {
+    QVector<rv1126b::VehicleEvent> added;
+    int firstChanged = events_.size(), lastChanged = -1;
+    QHash<rv1126b::EventIdentity, rv1126b::VehicleEvent> unique;
+    for (const auto& event : changes) unique.insert(event.identity, event);
+    for (const auto& event : unique) {
+        const int row = rowByIdentity_.value(event.identity, -1);
+        if (row >= 0) {
             events_[row] = event;
-            emit dataChanged(index(row, 0), index(row, ColumnCount - 1));
-            return;
-        }
+            firstChanged = qMin(firstChanged, row);
+            lastChanged = qMax(lastChanged, row);
+        } else added.append(event);
     }
-    beginInsertRows(QModelIndex(), 0, 0);
-    events_.prepend(event);
-    endInsertRows();
+    if (lastChanged >= 0) emit dataChanged(index(firstChanged, 0), index(lastChanged, ColumnCount - 1));
+    std::sort(added.begin(), added.end(), [](const auto& a, const auto& b) {
+        if (a.eventTime.epochMs != b.eventTime.epochMs) return a.eventTime.epochMs > b.eventTime.epochMs;
+        if (a.identity.eventId != b.identity.eventId) return a.identity.eventId > b.identity.eventId;
+        if (a.identity.trackId != b.identity.trackId) return a.identity.trackId > b.identity.trackId;
+        return a.identity.deviceId < b.identity.deviceId;
+    });
+    if (maximumRows > 0 && added.size() > maximumRows) added.resize(maximumRows);
+    if (!added.isEmpty()) {
+        beginInsertRows(QModelIndex(), 0, added.size() - 1);
+        events_ = added + events_;
+        rebuildEventIndex();
+        endInsertRows();
+    }
     if (maximumRows > 0 && events_.size() > maximumRows) {
         beginRemoveRows(QModelIndex(), maximumRows, events_.size() - 1);
         while (events_.size() > maximumRows) events_.removeLast();
+        rebuildEventIndex();
         endRemoveRows();
     }
+}
+
+void CaptureRecordTableModel::rebuildEventIndex()
+{
+    rowByIdentity_.clear();
+    for (int row = 0; row < events_.size(); ++row) rowByIdentity_.insert(events_.at(row).identity, row);
+    for (auto it = evidenceByIdentity_.begin(); it != evidenceByIdentity_.end();) {
+        if (!rowByIdentity_.contains(it.key())) it = evidenceByIdentity_.erase(it);
+        else ++it;
+    }
+    setProperty("evidenceStateCount", evidenceByIdentity_.size());
 }
 
 void CaptureRecordTableModel::removeVehicleEvent(const rv1126b::EventIdentity& identity)
@@ -248,6 +284,7 @@ void CaptureRecordTableModel::removeVehicleEvent(const rv1126b::EventIdentity& i
             beginRemoveRows(QModelIndex(), row, row);
             events_.removeAt(row);
             evidenceByIdentity_.remove(identity);
+            rebuildEventIndex();
             endRemoveRows();
             return;
         }
@@ -256,13 +293,11 @@ void CaptureRecordTableModel::removeVehicleEvent(const rv1126b::EventIdentity& i
 
 void CaptureRecordTableModel::setEvidenceState(const rv1126b::EvidenceCacheEntry& entry)
 {
+    const int row = rowByIdentity_.value(entry.identity, -1);
+    if (row < 0) return;
     evidenceByIdentity_.insert(entry.identity, entry);
-    for (int row = 0; row < events_.size(); ++row) {
-        if (events_.at(row).identity == entry.identity) {
-            emit dataChanged(index(row, EvidenceStatusColumn), index(row, EvidenceStatusColumn));
-            return;
-        }
-    }
+    setProperty("evidenceStateCount", evidenceByIdentity_.size());
+    emit dataChanged(index(row, EvidenceStatusColumn), index(row, EvidenceStatusColumn));
 }
 
 void CaptureRecordTableModel::addRecord(const CaptureRecord& record)
@@ -299,6 +334,9 @@ void CaptureRecordTableModel::clear()
 {
     beginResetModel();
     records_.clear();
+    events_.clear();
+    evidenceByIdentity_.clear();
+    rowByIdentity_.clear();
     endResetModel();
 }
 

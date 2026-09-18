@@ -153,6 +153,8 @@ class BoardApiClientTest final : public QObject
     Q_OBJECT
 
 private slots:
+    void repeatedRequestsReleaseContextConnectionsAndReplies();
+    void fileCancellationAndContextDestructionReleaseResources();
     void videoStreamsGetAndPutUseContract();
     void videoStreamsErrors_data();
     void videoStreamsErrors();
@@ -472,6 +474,60 @@ void BoardApiClientTest::videoStreamsErrors()
     QCOMPARE(result->error().category, category);
     QCOMPARE(result->error().code, code);
     QVERIFY(!result->error().message.contains(QStringLiteral("private board detail")));
+}
+
+void BoardApiClientTest::repeatedRequestsReleaseContextConnectionsAndReplies()
+{
+    class Context : public QObject { public: using QObject::receivers; } context;
+    TestHttpServer server;
+    QVERIFY(server.start());
+    server.response.body = healthPayload();
+    TestSecretStore secrets(QByteArrayLiteral("token"));
+    BoardApiCodec codec;
+    BoardApiClient client(profileFor(server), &secrets, &codec);
+    const int initial = context.receivers(SIGNAL(destroyed(QObject*)));
+    int completed = 0;
+    for (int i = 0; i < 100; ++i) {
+        client.getHealth(&context, [&](auto result) { QVERIFY(result); ++completed; });
+        QTRY_COMPARE(completed, i + 1);
+        QCOMPARE(context.receivers(SIGNAL(destroyed(QObject*))), initial);
+    }
+    QTRY_COMPARE(client.property("pendingRequestCount").toInt(), 0);
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    QCOMPARE(client.findChildren<QNetworkReply*>().size(), 0);
+}
+
+void BoardApiClientTest::fileCancellationAndContextDestructionReleaseResources()
+{
+    TestHttpServer server;
+    QVERIFY(server.start());
+    server.holdResponse = true;
+    TestSecretStore secrets(QByteArrayLiteral("token"));
+    BoardApiCodec codec;
+    BoardApiClient client(profileFor(server), &secrets, &codec);
+    QTemporaryDir dir;
+    const EventIdentity identity{QStringLiteral("rv1126b_001"), 1, 1};
+    int calls = 0;
+    const auto path = dir.filePath(QStringLiteral("cancelled.part"));
+    auto id = client.downloadEvidenceToPartFile(identity, QStringLiteral("/api/v1/events/1/1/evidence.jpg"),
+        path, this, [&](auto result) { QVERIFY(!result); ++calls; });
+    client.cancel(id);
+    QTRY_COMPARE(calls, 1);
+    auto* context = new QObject;
+    client.downloadEvidenceToPartFile(identity, QStringLiteral("/api/v1/events/1/1/evidence.jpg"),
+        dir.filePath(QStringLiteral("closed.part")), context, [&](auto) { ++calls; });
+    delete context;
+    QTRY_COMPARE(client.property("pendingRequestCount").toInt(), 0);
+    QTest::qWait(100);
+    QCOMPARE(calls, 1);
+    QVERIFY(QDir(dir.path()).entryList(QDir::Files).isEmpty());
+    server.holdResponse = false;
+    server.response.contentType = "image/jpeg";
+    server.response.body = QByteArray(2 * 1024 * 1024, 'x');
+    client.downloadEvidenceToPartFile(identity, QStringLiteral("/api/v1/events/1/1/evidence.jpg"), path,
+        this, [&](auto result) { QVERIFY(result); ++calls; });
+    QTRY_COMPARE(calls, 2);
+    QCOMPARE(QFileInfo(path).size(), qint64(2 * 1024 * 1024));
 }
 
 QTEST_MAIN(BoardApiClientTest)

@@ -27,6 +27,8 @@ private slots:
     void retriesConflictAndPromotesImage();
     void cancelPreventsScheduledRetry();
     void cancelAllRemovesActivePartFile();
+    void cancelledDownloadCannotCompleteReplacement();
+    void overflowRemainsPersistedAndQueueIsBounded();
     void removesLocalFileAndTreatsMissingAsSuccess();
     void reportsLocalFileRemovalFailure();
     void removeLocalCancelsActiveDownloadAndRemovesPartFile();
@@ -59,11 +61,12 @@ VehicleEvent makeEvent(qint64 eventId, const QString& deviceId = QStringLiteral(
 template<typename T>
 std::optional<ApiResult<T>> callResult(std::function<RequestId(ApiCompletion<T>)> invoker)
 {
-    std::optional<ApiResult<T>> result;
-    invoker([&result](ApiResult<T> value) {
-        result.emplace(std::move(value));
+    auto result = std::make_shared<std::optional<ApiResult<T>>>();
+    invoker([result](ApiResult<T> value) {
+        result->emplace(std::move(value));
     });
-    return result;
+    if (!QTest::qWaitFor([result] { return result->has_value(); }, 10000)) return std::nullopt;
+    return std::move(*result);
 }
 
 QString databasePath(QTemporaryDir& tempDir)
@@ -399,7 +402,7 @@ void EvidenceCacheTest::missingEvidencePersistsMissingWithoutGlobalCacheError()
 
     cache.enqueue(event);
 
-    QTRY_VERIFY(loadEvidence(repository, this, event.identity).status == EvidenceCacheStatus::Missing);
+    QTRY_VERIFY(!stateSpy.isEmpty() && stateSpy.last().at(0).value<EvidenceCacheEntry>().status == EvidenceCacheStatus::Missing);
     QCOMPARE(errorSpy.size(), 0);
 
     const EvidenceCacheEntry entry = loadEvidence(repository, this, event.identity);
@@ -474,10 +477,11 @@ void EvidenceCacheTest::cancelPreventsScheduledRetry()
     QTest::qWait(50);
     cache.cancel(event.identity);
 
-    QTest::qWait(1200);
+    QTest::qWait(2200); // Cover the periodic persistent-queue refill as well.
     QCOMPARE(client.requestedIdentities.size(), 1);
     const EvidenceCacheEntry entry = loadEvidence(repository, this, event.identity);
-    QCOMPARE(entry.status, EvidenceCacheStatus::RetryWait);
+    QCOMPARE(entry.status, EvidenceCacheStatus::Failed);
+    QCOMPARE(entry.failureCode, QStringLiteral("cancelled"));
 }
 
 void EvidenceCacheTest::cancelAllRemovesActivePartFile()
@@ -519,7 +523,7 @@ void EvidenceCacheTest::removesLocalFileAndTreatsMissingAsSuccess()
 
     const RequestId firstId = cache.removeLocal(event, this, [](ApiResult<void>) {});
     QVERIFY(!firstId.isNull());
-    QVERIFY(!QFileInfo::exists(finalPath));
+    QTRY_VERIFY(!QFileInfo::exists(finalPath));
 
     auto second = callResult<void>([&](ApiCompletion<void> completion) {
         return cache.removeLocal(event, this, std::move(completion));
@@ -575,6 +579,70 @@ void EvidenceCacheTest::removeLocalCancelsActiveDownloadAndRemovesPartFile()
     QCOMPARE(client.cancelCalls, 1);
     QVERIFY(!QFileInfo::exists(partPath));
     QVERIFY(!QFileInfo::exists(cache.finalPathFor(event)));
+}
+
+void EvidenceCacheTest::cancelledDownloadCannotCompleteReplacement()
+{
+    QTemporaryDir dir;
+    SqliteEventRepository repository(databasePath(dir));
+    initializeRepository(repository, this);
+    FakeBoardApiClient client;
+    client.mode = FakeBoardApiClient::DownloadMode::Hold;
+    const auto event = makeEvent(900);
+    BoardEvidenceCache cache(&client, &repository, dir.filePath(QStringLiteral("cache")));
+    cache.enqueue(event);
+    QTRY_COMPARE(client.heldDownloads.size(), 1);
+    cache.cancel(event.identity);
+    cache.enqueue(event);
+    QTRY_COMPARE(client.heldDownloads.size(), 2);
+    const auto old = client.heldDownloads[0];
+    const auto current = client.heldDownloads[1];
+    QVERIFY(old.partFilePath != current.partFilePath);
+    auto complete = [](const FakeBoardApiClient::HeldDownload& download) {
+        QVERIFY(writeJpeg(download.partFilePath));
+        EvidenceDownloadResult result;
+        result.partFilePath = download.partFilePath;
+        result.receivedBytes = QFileInfo(download.partFilePath).size();
+        result.expectedContentLength = result.receivedBytes;
+        download.completion(ApiResult<EvidenceDownloadResult>::success(result));
+    };
+    complete(old);
+    QVERIFY(!QFileInfo::exists(old.partFilePath));
+    QVERIFY(!QFileInfo::exists(cache.finalPathFor(event)));
+    complete(current);
+    QTRY_VERIFY(QFileInfo::exists(cache.finalPathFor(event)));
+    QCOMPARE(loadEvidence(repository, this, event.identity).status, EvidenceCacheStatus::Available);
+}
+
+void EvidenceCacheTest::overflowRemainsPersistedAndQueueIsBounded()
+{
+    QTemporaryDir dir;
+    SqliteEventRepository repository(databasePath(dir));
+    initializeRepository(repository, this);
+    QVector<VehicleEvent> events;
+    for (int i = 0; i < 300; ++i) events.append(makeEvent(1000 + i));
+    auto saved = callResult<void>([&](auto done) { return repository.upsertEvents(events, this, done); });
+    QVERIFY(saved && *saved);
+    FakeBoardApiClient client;
+    client.mode = FakeBoardApiClient::DownloadMode::Hold;
+    BoardEvidenceCache cache(&client, &repository, dir.filePath(QStringLiteral("cache")));
+    for (const auto& event : events) cache.enqueue(event);
+    QTRY_COMPARE(client.heldDownloads.size(), 1);
+    QTRY_COMPARE(repository.property("pendingRequestCount").toInt(), 0);
+    QVERIFY(cache.property("queuedDownloadCount").toInt() <= 256);
+    cache.cancelAll();
+    auto pending = callResult<QVector<VehicleEvent>>([&](auto done) {
+        return repository.loadPendingEvidence(256, {events.first().identity.deviceId}, {}, this, done);
+    });
+    QVERIFY(pending && *pending);
+    QCOMPARE(pending->value().size(), 256);
+    QVector<EventIdentity> excluded;
+    for (const auto& event : pending->value()) excluded.append(event.identity);
+    auto remaining = callResult<QVector<VehicleEvent>>([&](auto done) {
+        return repository.loadPendingEvidence(256, {events.first().identity.deviceId}, excluded, this, done);
+    });
+    QVERIFY(remaining && *remaining);
+    QCOMPARE(remaining->value().size(), 44);
 }
 
 QTEST_MAIN(EvidenceCacheTest)

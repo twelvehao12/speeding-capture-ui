@@ -16,6 +16,9 @@ DeviceIntegrationController::DeviceIntegrationController(
     : QObject(parent)
     , dependencies_(dependencies)
 {
+    streamSwitchTimer_.setSingleShot(true);
+    streamSwitchTimer_.setInterval(200);
+    connect(&streamSwitchTimer_, &QTimer::timeout, this, [this] { openSelectedStream(); });
     if (dependencies_.discovery) {
         connect(dependencies_.discovery, &DeviceDiscoveryService::deviceFound,
                 this, &DeviceIntegrationController::handleDeviceFound);
@@ -338,14 +341,14 @@ void DeviceIntegrationController::setStreamRole(RtspStreamRole role)
         return;
     }
     streamRole_ = role;
-    openSelectedStream();
+    streamSwitchTimer_.start();
 }
 
 void DeviceIntegrationController::restartSelectedStream(const QString& deviceId)
 {
     if (!deviceId.isEmpty() && deviceId == selectedVideoDeviceId_ && deviceId == playbackDeviceId_
         && !playbackSuspended_ && !shutdown_)
-        openSelectedStream();
+        openSelectedStream(true);
 }
 
 void DeviceIntegrationController::setPlaybackSuspended(bool suspended)
@@ -423,7 +426,7 @@ void DeviceIntegrationController::handleSessionChanged(const DeviceSessionSnapsh
     }
 
     if (snapshot.state == DeviceSessionState::Online) {
-        openSelectedStream();
+        if (!streamSwitchTimer_.isActive()) openSelectedStream();
     } else if (snapshot.state == DeviceSessionState::AuthenticationFailed) {
         stopPlayback();
         if (previousState != DeviceSessionState::AuthenticationFailed) {
@@ -443,7 +446,7 @@ void DeviceIntegrationController::handleSelectedVideoDeviceChanged(const QString
     stopPlayback();
     selectedVideoDeviceId_ = deviceId;
     emit selectedVideoDeviceChanged(deviceId);
-    openSelectedStream();
+    if (!deviceId.isEmpty()) streamSwitchTimer_.start();
 }
 
 void DeviceIntegrationController::handleFleetError(const ApiError& error)
@@ -522,7 +525,7 @@ std::optional<DeviceSessionSnapshot> DeviceIntegrationController::sessionFor(
     return *it;
 }
 
-void DeviceIntegrationController::openSelectedStream()
+void DeviceIntegrationController::openSelectedStream(bool force)
 {
     if (shutdown_ || playbackSuspended_ || !dependencies_.player || selectedVideoDeviceId_.isEmpty()) {
         return;
@@ -551,12 +554,21 @@ void DeviceIntegrationController::openSelectedStream()
     stream.deviceId = selectedVideoDeviceId_;
     stream.url = url;
     stream.role = streamRole_;
-    dependencies_.player->open(stream);
+    const auto state = dependencies_.player->state();
+    if (!force && playbackSpec_ && playbackSpec_->deviceId == stream.deviceId
+        && playbackSpec_->url == stream.url && playbackSpec_->role == stream.role
+        && (state == RtspPlayerState::Opening || state == RtspPlayerState::Playing
+            || state == RtspPlayerState::Reconnecting)) return;
+    streamSwitchTimer_.stop();
+    playbackSpec_ = stream;
     playbackDeviceId_ = selectedVideoDeviceId_;
+    dependencies_.player->open(stream);
 }
 
 void DeviceIntegrationController::stopPlayback()
 {
+    streamSwitchTimer_.stop();
+    playbackSpec_.reset();
     if (!dependencies_.player || playbackDeviceId_.isEmpty()) {
         return;
     }

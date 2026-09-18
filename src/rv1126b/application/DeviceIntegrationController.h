@@ -9,6 +9,7 @@
 #include <QHash>
 #include <QObject>
 #include <QVector>
+#include <QTimer>
 
 #include <optional>
 #include <functional>
@@ -83,7 +84,7 @@ private:
     DeviceProfile profileFor(const DiscoveredDeviceDto& device,
                              const QString& credentialRef) const;
     std::optional<DeviceSessionSnapshot> sessionFor(const QString& deviceId) const;
-    void openSelectedStream();
+    void openSelectedStream(bool force = false);
     void stopPlayback();
     void emitSafeError(const ApiError& error);
     void emitUnavailable();
@@ -95,6 +96,8 @@ private:
     RequestId activeProbeId_;
     QString selectedVideoDeviceId_;
     QString playbackDeviceId_;
+    std::optional<RtspStreamSpec> playbackSpec_;
+    QTimer streamSwitchTimer_;
     RtspStreamRole streamRole_ = RtspStreamRole::Sub;
     bool scanning_ = false;
     bool shutdown_ = false;

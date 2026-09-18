@@ -12,8 +12,10 @@
 #include <QTimer>
 
 #include <utility>
+#include <memory>
 
 namespace rv1126b {
+class FileDownloadExecutor;
 
 class BoardApiClient final : public IBoardApiClient
 {
@@ -31,6 +33,7 @@ public:
         ISecretStore* secretStore,
         const IApiCodec* codec,
         QObject* parent = nullptr);
+    ~BoardApiClient() override;
 
     DeviceProfile profile() const;
     void setProfile(DeviceProfile profile);
@@ -89,6 +92,8 @@ private:
         std::function<void(const ApiError&)> fail;
         std::function<void(const QByteArray&)> succeedJson;
         std::function<void(const EvidenceDownloadResult&)> succeedEvidence;
+        QMetaObject::Connection contextDestroyed;
+        bool fileDownload = false;
     };
 
     RequestId startJsonRequest(
@@ -116,10 +121,7 @@ private:
     bool applyAuthorization(QNetworkRequest* request, ApiError* error) const;
     QNetworkReply* issueRequest(QNetworkAccessManager::Operation operation, const QNetworkRequest& request, const QByteArray& body);
     void completeJsonRequest(const RequestId& requestId);
-    void completeEvidenceRequest(
-        const RequestId& requestId,
-        const QString& partFilePath,
-        const QString& requiredContentTypePrefix);
+    void watchContext(const RequestId& requestId, QObject* context);
     void stopConnectTimer(const RequestId& requestId);
     void failPending(const RequestId& requestId, const ApiError& error, bool abortReply);
     ApiError localError(const QString& code, const QString& message, ApiErrorCategory category, bool retryable = false) const;
@@ -151,7 +153,8 @@ private:
         int transferTimeoutMs = JsonRequestTimeoutMs)
     {
         return startJsonRequest(operation, url, body, context,
-            [completion = std::move(completion), parser = std::move(parser)](ApiResult<QByteArray> result) mutable {
+            [guard = QPointer<BoardApiClient>(this), completion = std::move(completion), parser = std::move(parser)](ApiResult<QByteArray> result) mutable {
+                if (!guard) return;
                 if (!result.isSuccess()) {
                     completion(ApiResult<T>::failure(result.error()));
                     return;
@@ -175,6 +178,7 @@ private:
     const IApiCodec* codec_ = nullptr;
     QNetworkAccessManager networkAccessManager_;
     QHash<RequestId, PendingRequest> pendingRequests_;
+    std::unique_ptr<FileDownloadExecutor> fileDownloads_;
 };
 
 } // namespace rv1126b

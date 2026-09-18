@@ -84,6 +84,16 @@ public:
 
     virtual void cancel(const RequestId& requestId) = 0;
     virtual void cancelAll() = 0;
+
+    // Bounded recovery of persisted download work. Test/alternate repositories may opt out.
+    virtual RequestId loadPendingEvidence(int limit, const QStringList& deviceIds,
+        const QVector<EventIdentity>& excluded, QObject* context,
+        ApiCompletion<QVector<VehicleEvent>> completion)
+    {
+        Q_UNUSED(limit) Q_UNUSED(deviceIds) Q_UNUSED(excluded) Q_UNUSED(context)
+        if (completion) completion(ApiResult<QVector<VehicleEvent>>::success({}));
+        return RequestId::createUuid();
+    }
 };
 
 } // namespace rv1126b

@@ -2,6 +2,7 @@
 #include "rv1126b/infrastructure/video/QtMultimediaRtspPlayer.h"
 #include "rv1126b/application/Rv1126bApplicationRuntime.h"
 #include "services/SystemSettingsService.h"
+#include "services/UiPerformanceMonitor.h"
 
 #include <QApplication>
 #include <QCommandLineOption>
@@ -16,6 +17,7 @@ int main(int argc, char* argv[])
         qputenv("QT_FFMPEG_DECODING_HW_DEVICE_TYPES", "d3d11va,dxva2");
     }
     QApplication app(argc, argv);
+    UiPerformanceMonitor performanceMonitor(&app);
 
     QCoreApplication::setOrganizationName("CameraTools");
     QCoreApplication::setApplicationName("CameraManagerApp");

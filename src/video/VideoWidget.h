@@ -6,6 +6,8 @@
 
 #include <QImage>
 #include <QWidget>
+#include <QFutureWatcher>
+#include "../rv1126b/services/CacheFileLease.h"
 
 #include <optional>
 
@@ -30,6 +32,7 @@ public:
     };
 
     explicit VideoWidget(Mode mode, QWidget* parent = nullptr);
+    ~VideoWidget() override;
 
     void setDevice(const Device* device);
     void setLatestRecord(const CaptureRecord* record);
@@ -43,9 +46,12 @@ public:
 
 protected:
     void paintEvent(QPaintEvent* event) override;
+    void resizeEvent(QResizeEvent* event) override;
+    void mouseDoubleClickEvent(QMouseEvent* event) override;
 
 private slots:
     void advanceFrame();
+    void loadEvidenceImage();
 
 private:
     void drawBackground(QPainter& painter, const QRect& rect) const;
@@ -74,4 +80,8 @@ private:
     std::optional<rv1126b::EvidenceCacheEntry> evidenceEntry_;
     QImage evidenceImage_;
     QString evidenceMessage_;
+    QTimer* evidenceLoadTimer_ = nullptr;
+    QFutureWatcher<QImage>* imageWatcher_ = nullptr;
+    quint64 imageGeneration_ = 0;
+    std::shared_ptr<rv1126b::CacheFileLease> imageLease_;
 };

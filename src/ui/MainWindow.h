@@ -27,6 +27,7 @@ class QSpinBox;
 class QTableView;
 class QTabWidget;
 class QTimer;
+class QProgressDialog;
 class QToolButton;
 class QWidget;
 
@@ -225,4 +226,5 @@ private:
     int lastHistoryRowCount_ = 0;
     bool mockMode_ = false;
     bool shutdownStarted_ = false;
+    QHash<QString, QPointer<QProgressDialog>> bulkDialogs_;
 };

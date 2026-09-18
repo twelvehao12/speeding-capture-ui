@@ -194,6 +194,14 @@ Rv1126bDeviceManagementDialog::Rv1126bDeviceManagementDialog(
     connect(taskRefreshTimer_, &QTimer::timeout, this, &Rv1126bDeviceManagementDialog::refreshTasks);
     connect(tabs_, &QTabWidget::currentChanged, this, [this]() { updateTaskRefreshState(); });
     connectController();
+    if (ftpReceiveServer_) connect(ftpReceiveServer_, &rv1126b::EmbeddedFtpReceiveServer::started,
+        this, [this](bool success) {
+            const auto apply = pendingLocalFtpApply_;
+            pendingLocalFtpApply_.reset();
+            if (!success) localFtpStatus_->setText(QStringLiteral("接收服务启动失败：%1").arg(ftpReceiveServer_->lastError()));
+            updateLocalFtpReceiverState();
+            if (success && apply) applyLocalFtpTarget(*apply);
+        });
 
     if (!controller_) {
         globalMessage_->setText(QStringLiteral("设备操作控制器尚未装配"));
@@ -1290,20 +1298,15 @@ void Rv1126bDeviceManagementDialog::startLocalFtpReceiver()
     config.controlPort = static_cast<quint16>(localFtpPortSpin_->value());
     config.passivePortStart = static_cast<quint16>(localFtpPassiveStartSpin_->value());
     config.passivePortEnd = static_cast<quint16>(localFtpPassiveEndSpin_->value());
-    if (!ftpReceiveServer_->start(config)) {
-        localFtpStatus_->setText(QStringLiteral("接收服务启动失败：%1").arg(ftpReceiveServer_->lastError()));
-        updateLocalFtpReceiverState();
-        return;
-    }
-    localFtpStatus_->setText(QStringLiteral("接收服务已启动：%1:%2，目录 %3")
-                                 .arg(host.toString())
-                                 .arg(ftpReceiveServer_->controlPort())
-                                 .arg(config.rootPath));
+    if (ftpReceiveServer_->isStarting()) return;
+    ftpReceiveServer_->startAsync(config);
+    localFtpStatus_->setText(QStringLiteral("正在启动接收服务…"));
     updateLocalFtpReceiverState();
 }
 
 void Rv1126bDeviceManagementDialog::stopLocalFtpReceiver()
 {
+    pendingLocalFtpApply_.reset();
     if (ftpReceiveServer_) ftpReceiveServer_->stop();
     if (localFtpStatus_) localFtpStatus_->setText(QStringLiteral("接收服务已停止"));
     updateLocalFtpReceiverState();
@@ -1312,7 +1315,10 @@ void Rv1126bDeviceManagementDialog::stopLocalFtpReceiver()
 void Rv1126bDeviceManagementDialog::applyLocalFtpTarget(bool saveAndEnable)
 {
     if (!ftpReceiveServer_ || !ftpReceiveServer_->isListening()) {
+        pendingLocalFtpApply_ = saveAndEnable;
         startLocalFtpReceiver();
+        if (!ftpReceiveServer_ || !ftpReceiveServer_->isStarting()) pendingLocalFtpApply_.reset();
+        return;
     }
     if (!ftpReceiveServer_ || !ftpReceiveServer_->isListening()) return;
     writeLocalFtpTargetRow();
@@ -1333,8 +1339,9 @@ void Rv1126bDeviceManagementDialog::updateLocalFtpReceiverState()
 {
     const bool available = ftpReceiveServer_ != nullptr;
     const bool running = available && ftpReceiveServer_->isListening();
-    if (localFtpStartButton_) localFtpStartButton_->setEnabled(available && !running);
-    if (localFtpStopButton_) localFtpStopButton_->setEnabled(running);
+    const bool starting = available && ftpReceiveServer_->isStarting();
+    if (localFtpStartButton_) localFtpStartButton_->setEnabled(available && !running && !starting);
+    if (localFtpStopButton_) localFtpStopButton_->setEnabled(running || starting);
     if (!localFtpStatus_) return;
     if (!available) {
         localFtpStatus_->setText(QStringLiteral("当前应用运行时未装配内置 FTP 接收服务"));

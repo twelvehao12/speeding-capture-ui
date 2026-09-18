@@ -4,6 +4,7 @@
 #include <QSqlDatabase>
 #include <QSqlQuery>
 #include <QTemporaryDir>
+#include <QTimer>
 #include <QtTest>
 
 #include <optional>
@@ -21,6 +22,7 @@ private slots:
     void storesEvidenceAnchorsAndFtpSnapshots();
     void queriesFtpTaskSnapshotsWithTargets();
     void migratesEvidenceCacheLocalPathToNullable();
+    void largeWriteKeepsEventLoopResponsiveAndCancellationIsSafe();
 };
 
 namespace {
@@ -73,11 +75,12 @@ VehicleEvent makeEvent(OcrStatus ocrStatus, qint64 updatedEpochMs)
 template<typename T>
 std::optional<ApiResult<T>> callResult(std::function<RequestId(ApiCompletion<T>)> invoker)
 {
-    std::optional<ApiResult<T>> result;
-    invoker([&result](ApiResult<T> value) {
-        result.emplace(std::move(value));
+    auto result = std::make_shared<std::optional<ApiResult<T>>>();
+    invoker([result](ApiResult<T> value) {
+        result->emplace(std::move(value));
     });
-    return result;
+    if (!QTest::qWaitFor([result] { return result->has_value(); }, 10000)) return std::nullopt;
+    return std::move(*result);
 }
 
 QString databasePath(QTemporaryDir& tempDir)
@@ -585,6 +588,51 @@ void SqliteEventRepositoryTest::migratesEvidenceCacheLocalPathToNullable()
     QVERIFY(loaded->value().has_value());
     QCOMPARE(loaded->value()->status, EvidenceCacheStatus::Failed);
     QCOMPARE(loaded->value()->localFilePath, QString());
+}
+
+void SqliteEventRepositoryTest::largeWriteKeepsEventLoopResponsiveAndCancellationIsSafe()
+{
+    QTemporaryDir dir;
+    SqliteEventRepository repository(dir.filePath(QStringLiteral("stress.sqlite")));
+    auto init = callResult<void>([&](auto done) { return repository.initialize(this, done); });
+    QVERIFY(init && *init);
+    QVector<VehicleEvent> events;
+    events.reserve(100000);
+    for (int i = 0; i < 100000; ++i) {
+        auto event = makeEvent(OcrStatus::Matched, i);
+        event.identity.eventId = i;
+        event.eventTime.epochMs = i;
+        events.append(event);
+    }
+    int heartbeats = 0;
+    QTimer heartbeat;
+    heartbeat.setInterval(10);
+    connect(&heartbeat, &QTimer::timeout, this, [&] { ++heartbeats; });
+    heartbeat.start();
+    bool written = false;
+    repository.upsertEvents(events, this, [&](ApiResult<void> result) {
+        QVERIFY(result);
+        QCOMPARE(QThread::currentThread(), thread());
+        written = true;
+    });
+    QVERIFY(!written); // Completion must not run inline.
+    bool cancelledCalled = false;
+    auto id = repository.queryEvents(EventQuery{}, this, [&](auto) { cancelledCalled = true; });
+    repository.cancel(id);
+    auto* context = new QObject;
+    repository.queryEvents(EventQuery{}, context, [&](auto) { cancelledCalled = true; });
+    delete context;
+    QTRY_VERIFY_WITH_TIMEOUT(written, 60000);
+    QVERIFY(heartbeats > 0);
+    EventQuery query;
+    query.limit = 100;
+    query.offset = 99900;
+    auto rows = callResult<QVector<VehicleEvent>>([&](auto done) { return repository.queryEvents(query, this, done); });
+    QVERIFY(rows && *rows);
+    QCOMPARE(rows->value().size(), 100);
+    QCOMPARE(rows->value().first().identity.eventId, 99);
+    QVERIFY(!cancelledCalled);
+    QCOMPARE(repository.property("pendingRequestCount").toInt(), 0);
 }
 
 QTEST_MAIN(SqliteEventRepositoryTest)

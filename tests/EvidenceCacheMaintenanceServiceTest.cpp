@@ -1,4 +1,5 @@
 #include "../src/rv1126b/services/EvidenceCacheMaintenanceService.h"
+#include "../src/rv1126b/services/CacheFileLease.h"
 
 #include <QDateTime>
 #include <QDir>
@@ -6,6 +7,7 @@
 #include <QFileInfo>
 #include <QTemporaryDir>
 #include <QTest>
+#include <QSignalSpy>
 
 using namespace rv1126b;
 
@@ -18,6 +20,7 @@ private slots:
     void trimsOldestFilesWhenCapacityExceeded();
     void neverDeletesPartFiles();
     void deletesOldestFilesWhenFreeSpaceIsBelowThreshold();
+    void backgroundCleanupSkipsLeasedFilesAndCanCancel();
 };
 
 namespace {
@@ -134,6 +137,27 @@ void EvidenceCacheMaintenanceServiceTest::deletesOldestFilesWhenFreeSpaceIsBelow
     QCOMPARE(result.deletedFiles, 1);
     QVERIFY(!QFileInfo::exists(oldest));
     QVERIFY(QFileInfo::exists(newest));
+}
+
+void EvidenceCacheMaintenanceServiceTest::backgroundCleanupSkipsLeasedFilesAndCanCancel()
+{
+    QTemporaryDir dir;
+    const auto path = writeFile(dir.filePath(QStringLiteral("leased.jpg")), 32, 60);
+    auto lease = CacheFileLease::acquire(path);
+    QVERIFY(lease);
+    EvidenceCacheMaintenanceService service(dir.path());
+    QSignalSpy finished(&service, &EvidenceCacheMaintenanceService::cleanupFinished);
+    service.cleanupAsync(basePolicy());
+    QTRY_COMPARE(finished.size(), 1);
+    QVERIFY(QFileInfo::exists(path));
+    lease.reset();
+    service.cleanupAsync(basePolicy());
+    QTRY_COMPARE(finished.size(), 2);
+    QVERIFY(!QFileInfo::exists(path));
+    service.cleanupAsync(basePolicy());
+    service.cancel();
+    QTest::qWait(30);
+    QCOMPARE(finished.size(), 2);
 }
 
 QTEST_MAIN(EvidenceCacheMaintenanceServiceTest)

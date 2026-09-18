@@ -71,4 +71,6 @@ D:\Qt\6.11.1\mingw_64\bin\windeployqt.exe build\mingw-release\CameraManagerApp.e
 
 ## 相关仓库
 
+性能优化、诊断开关及验收步骤见 [2K 预览与快速操作优化实施记录](doc/2K预览与快速操作优化实施记录.md)。
+
 - 板端管线：`Felosefe/RV1126B_CAM`

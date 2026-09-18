@@ -180,6 +180,7 @@ void Rv1126bApplicationRuntime::shutdown()
 {
     if (shutdown_) return;
     shutdown_ = true;
+    if (evidenceMaintenance_) evidenceMaintenance_->cancel();
     if (evidenceCache_) evidenceCache_->cancelAll();
     if (ftpReceiveServer_) ftpReceiveServer_->stop();
     if (directProbe_) directProbe_->cancelAll();
